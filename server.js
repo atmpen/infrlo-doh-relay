@@ -1,6 +1,6 @@
 'use strict';
 
-// Infrlo DoH relay — v1.3.0
+// Infrlo DoH relay — v1.3.1
 // RFC 8484 DNS-over-HTTPS relay. Infrlo expects the app on 0.0.0.0:5000.
 // Dependency-free on purpose: the platform only needs `node server.js`.
 
@@ -9,7 +9,7 @@ const http2 = require('node:http2');
 const crypto = require('node:crypto');
 const { buildEcsData, injectEcs } = require('./lib/ecs');
 
-const VERSION = '1.3.0';
+const VERSION = '1.3.1';
 const PORT = process.env.PORT === undefined || process.env.PORT === ''
   ? 5000
   : Number(process.env.PORT);

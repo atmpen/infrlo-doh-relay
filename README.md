@@ -1,6 +1,6 @@
 # infrlo-doh-relay
 
-v1.3.0 — a dependency-free [RFC 8484](https://www.rfc-editor.org/rfc/rfc8484) DNS-over-HTTPS relay, made for [Infrlo](https://infrlo.com/).
+v1.3.1 — a dependency-free [RFC 8484](https://www.rfc-editor.org/rfc/rfc8484) DNS-over-HTTPS relay, made for [Infrlo](https://infrlo.com/).
 
 It accepts DoH queries on `/<DOH_TOKEN>/weduolijia`, injects a fixed EDNS Client Subnet (ECS) into every upstream query, forwards the DNS wire message over HTTP/2, and returns the answer unchanged. No cache, no query logging, no npm dependencies.
 
@@ -25,13 +25,22 @@ In the Infrlo dashboard, **Deploy → From Public URL** and use:
 | Repository URL | `https://github.com/weduolijia/infrlo-doh-relay` |
 | Branch | `main` |
 | Build command | `npm install` |
-| Run command | `node server.js` |
+| Run command | `sh start.sh` |
 
 Set `DOH_TOKEN` to your secret in the environment variables section. **The relay refuses to start without it** — this is deliberate, so it cannot accidentally run as an open resolver.
 
-Then open `https://<your-app-domain>/health`; it should return JSON with `"version":"1.3.0"`.
+Then open `https://<your-app-domain>/health`; it should return JSON with `"version":"1.3.1"`.
 
 The `Dockerfile` is included for platforms that build images directly. It pins Node 20 and runs as the non-root `node` user.
+
+### CA bundle and startup script
+
+`start.sh` exports the Mozilla CA bundle before starting the relay:
+
+- `SSL_CERT_FILE=$DIR/certs/cacert.pem`
+- `NODE_EXTRA_CA_CERTS=$DIR/certs/cacert.pem`
+
+`certs/cacert.pem` is the Mozilla root bundle from <https://curl.se/ca/cacert.pem> (extracted 2026-10-20, 118 certificates). This is the trust store for the relay's outbound HTTPS requests to AdGuard, Quad9, and Google. If the Infrlo run command is `node server.js`, the script is skipped; use `sh start.sh` instead. The Dockerfile bakes the same environment into the image.
 
 ### Environment variables
 
@@ -90,7 +99,7 @@ node -e "console.log(require('fs').readFileSync('answer.bin').toString('hex'))"
 ## Run and test locally
 
 ```bash
-DOH_TOKEN=dev-token npm start   # listens on 127.0.0.1:5000
+DOH_TOKEN=dev-token sh start.sh   # listens on 127.0.0.1:5000
 npm test                         # hermetic tests; local HTTP/1.1 and HTTP/2 mocks play the upstream
 ```
 

@@ -267,7 +267,7 @@ test('health endpoint reports the version', async () => {
     assert.equal(response.status, 200);
     const body = await response.json();
     assert.equal(body.status, 'ok');
-    assert.equal(body.version, '1.3.0');
+    assert.equal(body.version, '1.3.1');
     assert.equal(body.auth, true);
     assert.equal(body.suffix, TEST_SUFFIX);
   } finally {
