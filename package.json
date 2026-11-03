@@ -1,0 +1,12 @@
+{
+  "name": "infrlo-doh-relay",
+  "version": "1.0.1",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
