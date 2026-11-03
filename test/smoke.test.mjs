@@ -14,6 +14,8 @@ const { buildEcsData, injectEcs } = ecs;
 const here = path.dirname(fileURLToPath(import.meta.url));
 const serverPath = path.join(here, '..', 'server.js');
 const ANSWER_IP = '203.0.113.7';
+const TEST_TOKEN = 'smoke-test-token';
+const TEST_SUFFIX = 'weduolijia';
 
 function buildQuery(name, type = 1) {
   const header = Buffer.alloc(12);
@@ -197,7 +199,7 @@ async function closedPort() {
 
 async function startRelay(env = {}) {
   const child = spawn(process.execPath, [serverPath], {
-    env: { ...process.env, PORT: '0', ...env },
+    env: { ...process.env, PORT: '0', DOH_TOKEN: TEST_TOKEN, DOH_SUFFIX: TEST_SUFFIX, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let output = '';
@@ -232,7 +234,7 @@ async function stopRelay(child) {
 }
 
 function dohPost(base, query, headers = {}) {
-  return fetch(base + '/dns-query', {
+  return fetch(`${base}/${TEST_TOKEN}/${TEST_SUFFIX}`, {
     method: 'POST',
     headers: { 'content-type': 'application/dns-message', ...headers },
     body: query,
@@ -265,7 +267,9 @@ test('health endpoint reports the version', async () => {
     assert.equal(response.status, 200);
     const body = await response.json();
     assert.equal(body.status, 'ok');
-    assert.equal(body.version, '1.2.0');
+    assert.equal(body.version, '1.3.0');
+    assert.equal(body.auth, true);
+    assert.equal(body.suffix, TEST_SUFFIX);
   } finally {
     await stopRelay(relay.child);
   }
@@ -291,7 +295,9 @@ test('GET DoH query returns the upstream answer', async () => {
   const relay = await startRelay({ DOH_UPSTREAMS: mockUpstream });
   try {
     const query = buildQuery('example.com');
-    const response = await fetch(relay.base + '/dns-query?dns=' + query.toString('base64url'));
+    const response = await fetch(
+      `${relay.base}/${TEST_TOKEN}/${TEST_SUFFIX}?dns=` + query.toString('base64url'),
+    );
     assert.equal(response.status, 200);
     assertAnswer(Buffer.from(await response.arrayBuffer()), query);
   } finally {
@@ -302,7 +308,7 @@ test('GET DoH query returns the upstream answer', async () => {
 test('rejects a non-DNS content type', async () => {
   const relay = await startRelay({ DOH_UPSTREAMS: mockUpstream });
   try {
-    const response = await fetch(relay.base + '/dns-query', {
+    const response = await fetch(`${relay.base}/${TEST_TOKEN}/${TEST_SUFFIX}`, {
       method: 'POST',
       headers: { 'content-type': 'text/plain' },
       body: 'not dns',
@@ -316,7 +322,7 @@ test('rejects a non-DNS content type', async () => {
 test('rejects a GET without the dns parameter', async () => {
   const relay = await startRelay({ DOH_UPSTREAMS: mockUpstream });
   try {
-    const response = await fetch(relay.base + '/dns-query');
+    const response = await fetch(`${relay.base}/${TEST_TOKEN}/${TEST_SUFFIX}`);
     assert.equal(response.status, 400);
   } finally {
     await stopRelay(relay.child);
@@ -326,34 +332,43 @@ test('rejects a GET without the dns parameter', async () => {
 test('unknown paths are 404', async () => {
   const relay = await startRelay({ DOH_UPSTREAMS: mockUpstream });
   try {
-    const response = await fetch(relay.base + '/not-dns');
-    assert.equal(response.status, 404);
+    assert.equal((await fetch(relay.base + '/not-dns')).status, 404);
+    assert.equal((await fetch(`${relay.base}/${TEST_TOKEN}/dns-query`)).status, 404);
   } finally {
     await stopRelay(relay.child);
   }
 });
 
-test('token auth accepts query and path forms', async () => {
+test('token auth is required before the DoH path', async () => {
   const relay = await startRelay({ DOH_UPSTREAMS: mockUpstream, DOH_TOKEN: 'secret' });
   try {
     const query = buildQuery('example.com');
-    assert.equal((await dohPost(relay.base, query)).status, 401);
-    assert.equal((await dohPost(relay.base, query, { 'x-token': 'wrong' })).status, 401);
-
-    const viaQuery = await fetch(relay.base + '/dns-query?token=secret', {
+    const wrongToken = await fetch(`${relay.base}/wrong/${TEST_SUFFIX}`, {
       method: 'POST',
       headers: { 'content-type': 'application/dns-message' },
       body: query,
     });
-    assert.equal(viaQuery.status, 200);
-    assertAnswer(Buffer.from(await viaQuery.arrayBuffer()), query);
+    assert.equal(wrongToken.status, 401);
 
-    const viaPath = await fetch(relay.base + '/dns-query/secret', {
+    const good = await fetch(`${relay.base}/secret/${TEST_SUFFIX}`, {
       method: 'POST',
       headers: { 'content-type': 'application/dns-message' },
       body: query,
     });
-    assert.equal(viaPath.status, 200);
+    assert.equal(good.status, 200);
+    assertAnswer(Buffer.from(await good.arrayBuffer()), query);
+
+    const getGood = await fetch(
+      `${relay.base}/secret/${TEST_SUFFIX}?dns=` + query.toString('base64url'),
+    );
+    assert.equal(getGood.status, 200);
+
+    const oldPath = await fetch(`${relay.base}/secret/dns-query`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/dns-message' },
+      body: query,
+    });
+    assert.equal(oldPath.status, 404);
   } finally {
     await stopRelay(relay.child);
   }

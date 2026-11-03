@@ -1,6 +1,6 @@
 'use strict';
 
-// Infrlo DoH relay — v1.2.0
+// Infrlo DoH relay — v1.3.0
 // RFC 8484 DNS-over-HTTPS relay. Infrlo expects the app on 0.0.0.0:5000.
 // Dependency-free on purpose: the platform only needs `node server.js`.
 
@@ -9,7 +9,7 @@ const http2 = require('node:http2');
 const crypto = require('node:crypto');
 const { buildEcsData, injectEcs } = require('./lib/ecs');
 
-const VERSION = '1.2.0';
+const VERSION = '1.3.0';
 const PORT = process.env.PORT === undefined || process.env.PORT === ''
   ? 5000
   : Number(process.env.PORT);
@@ -20,6 +20,16 @@ const UPSTREAMS = (process.env.DOH_UPSTREAMS ||
   .map((item) => item.trim())
   .filter(Boolean);
 const DOH_TOKEN = (process.env.DOH_TOKEN || '').trim();
+// The DoH URL is /<DOH_TOKEN>/<DOH_SUFFIX>; the suffix is one path segment.
+const DOH_SUFFIX = (process.env.DOH_SUFFIX || 'weduolijia').trim().replace(/^\/+|\/+$/g, '');
+if (!DOH_TOKEN) {
+  console.error('DOH_TOKEN is required; refusing to start an unauthenticated relay.');
+  process.exit(1);
+}
+if (!DOH_SUFFIX || DOH_SUFFIX.includes('/')) {
+  console.error('DOH_SUFFIX must be a single path segment.');
+  process.exit(1);
+}
 // RATE_LIMIT_PER_MIN=0 disables the limiter; unset means 600/min per IP.
 const RATE_LIMIT_PER_MIN = process.env.RATE_LIMIT_PER_MIN === undefined
   ? 600
@@ -242,7 +252,6 @@ function rateLimited(ip) {
 }
 
 function tokenMatches(candidate) {
-  if (!DOH_TOKEN) return true;
   const given = Buffer.from(String(candidate || ''));
   const expected = Buffer.from(DOH_TOKEN);
   return given.length === expected.length && crypto.timingSafeEqual(given, expected);
@@ -276,8 +285,8 @@ function applyEcs(query) {
 function handle(req, res) {
   const url = new URL(req.url, 'http://localhost');
   const started = Date.now();
-  // Never log a path token: /dns-query/<token> is the private form.
-  const displayPath = url.pathname.startsWith('/dns-query/') ? '/dns-query/[redacted]' : url.pathname;
+  // The token is a path segment; never write it to logs.
+  const displayPath = `/[redacted]/${DOH_SUFFIX}`;
 
   if (url.pathname === '/' || url.pathname === '/health') {
     return send(
@@ -288,30 +297,32 @@ function handle(req, res) {
         version: VERSION,
         uptime: Math.round(process.uptime()),
         upstreams: UPSTREAMS.length,
-        auth: Boolean(DOH_TOKEN),
+        auth: true,
+        suffix: DOH_SUFFIX,
         ecs: ECS_DATA ? ECS_CIDR : 'off',
       }),
       'application/json; charset=utf-8',
     );
   }
 
-  let isDohPath = url.pathname === '/dns-query' || url.pathname === '/dns-query/';
-  let token = url.searchParams.get('token');
-  if (!isDohPath && url.pathname.startsWith('/dns-query/')) {
-    isDohPath = true;
-    try {
-      token = decodeURIComponent(url.pathname.slice('/dns-query/'.length));
-    } catch {
-      return send(res, 400, 'bad token encoding\n');
-    }
+  const segments = url.pathname.split('/').filter(Boolean);
+  if (segments.length !== 2 || segments[1] !== DOH_SUFFIX) {
+    return send(res, 404, 'not found\n');
   }
-  if (!isDohPath) return send(res, 404, 'not found\n');
 
-  // Limit before auth so a token guesser cannot brute-force at full speed.
+  let token;
+  try {
+    token = decodeURIComponent(segments[0]);
+  } catch {
+    return send(res, 400, 'bad token encoding\n');
+  }
+
+  // Auth first: no rate-limit bucket, DNS parsing or upstream work before this.
+  if (!tokenMatches(token)) return send(res, 401, 'unauthorized\n');
+
   if (rateLimited(clientIp(req))) {
     return send(res, 429, 'rate limited\n', 'text/plain; charset=utf-8', { 'retry-after': '60' });
   }
-  if (!tokenMatches(token)) return send(res, 401, 'unauthorized\n');
 
   const log = (status, extra = '') => {
     console.log(`${req.method} ${displayPath} ${status} ${Date.now() - started}ms${extra}`);
@@ -405,8 +416,9 @@ server.listen(PORT, '0.0.0.0', () => {
   const address = server.address();
   const actualPort = address && typeof address === 'object' ? address.port : PORT;
   console.log(`infrlo-doh-relay v${VERSION} listening on 0.0.0.0:${actualPort}`);
+  console.log(`doh path: /<token>/${DOH_SUFFIX}`);
   console.log(`upstreams: ${UPSTREAMS.join(', ')}`);
   console.log(`ecs: ${ECS_DATA ? ECS_CIDR : 'off'}`);
-  if (DOH_TOKEN) console.log('token auth: enabled');
+  console.log('token auth: required');
   if (RATE_LIMIT_PER_MIN) console.log(`rate limit: ${RATE_LIMIT_PER_MIN}/min per IP`);
 });
