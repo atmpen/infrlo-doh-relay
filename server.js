@@ -1,19 +1,21 @@
 'use strict';
 
-// Infrlo DoH relay — v1.1.1
+// Infrlo DoH relay — v1.2.0
 // RFC 8484 DNS-over-HTTPS relay. Infrlo expects the app on 0.0.0.0:5000.
 // Dependency-free on purpose: the platform only needs `node server.js`.
 
 const http = require('node:http');
-const https = require('node:https');
+const http2 = require('node:http2');
 const crypto = require('node:crypto');
+const { buildEcsData, injectEcs } = require('./lib/ecs');
 
-const VERSION = '1.1.1';
+const VERSION = '1.2.0';
 const PORT = process.env.PORT === undefined || process.env.PORT === ''
   ? 5000
   : Number(process.env.PORT);
+// Order matters only until the first success; the winning upstream is remembered.
 const UPSTREAMS = (process.env.DOH_UPSTREAMS ||
-  'https://cloudflare-dns.com/dns-query,https://dns.google/dns-query')
+  'https://unfiltered.adguard-dns.com/dns-query,https://dns11.quad9.net/dns-query,https://dns.google/dns-query')
   .split(',')
   .map((item) => item.trim())
   .filter(Boolean);
@@ -22,11 +24,22 @@ const DOH_TOKEN = (process.env.DOH_TOKEN || '').trim();
 const RATE_LIMIT_PER_MIN = process.env.RATE_LIMIT_PER_MIN === undefined
   ? 600
   : Math.max(0, Number(process.env.RATE_LIMIT_PER_MIN) || 0);
-const UPSTREAM_TIMEOUT_MS = Math.max(500, Number(process.env.UPSTREAM_TIMEOUT_MS) || 5000);
+const UPSTREAM_TIMEOUT_MS = Math.max(500, Number(process.env.UPSTREAM_TIMEOUT_MS) || 3000);
 const MAX_BODY = 65535;
+// Default ECS is a China Mobile /24 (AS9808, Beijing). DOH_ECS=off disables it.
+const ECS_CIDR = process.env.DOH_ECS === undefined ? '221.176.1.0/24' : process.env.DOH_ECS.trim();
+let ECS_DATA = null;
+if (ECS_CIDR && !/^(off|none|0)$/i.test(ECS_CIDR)) {
+  try {
+    ECS_DATA = buildEcsData(ECS_CIDR);
+  } catch (err) {
+    console.error(`invalid DOH_ECS (${ECS_CIDR}): ${err.message}; ECS disabled`);
+  }
+}
 
 let preferredUpstream = 0;
 const rateBuckets = new Map();
+const sessions = new Map();
 
 function orderedUpstreams() {
   const first = UPSTREAMS[preferredUpstream] || UPSTREAMS[0];
@@ -41,10 +54,24 @@ function isValidAnswer(data, queryId) {
   );
 }
 
-function relayOnce(base, method, queryString, body, cb) {
-  const url = new URL(base);
-  const transport = url.protocol === 'http:' ? http : https;
-  const isHttps = url.protocol !== 'http:';
+function getSession(url) {
+  const key = url.protocol + '//' + url.host;
+  let session = sessions.get(key);
+  if (session && !session.closed && !session.destroyed) return session;
+  const origin = url.protocol === 'http2:' ? `http://${url.host}` : `https://${url.host}`;
+  const options = url.protocol === 'http2:' ? {} : { servername: url.hostname };
+  session = http2.connect(origin, options);
+  const drop = () => {
+    if (sessions.get(key) === session) sessions.delete(key);
+  };
+  session.on('close', drop);
+  session.on('error', drop);
+  session.on('goaway', drop);
+  sessions.set(key, session);
+  return session;
+}
+
+function relayOnceH1(url, method, queryString, body, cb) {
   let done = false;
   let timer;
   const finish = (err, status, data) => {
@@ -54,10 +81,10 @@ function relayOnce(base, method, queryString, body, cb) {
     cb(err, status, data);
   };
 
-  const req = transport.request(
+  const req = http.request(
     {
       hostname: url.hostname,
-      port: url.port || (isHttps ? 443 : 80),
+      port: url.port || 80,
       path: url.pathname + (queryString ? '?' + queryString : ''),
       method,
       headers: {
@@ -84,7 +111,6 @@ function relayOnce(base, method, queryString, body, cb) {
     },
   );
 
-  // A hard timer also covers DNS lookup and TCP connect, which socket timeouts miss.
   timer = setTimeout(() => {
     req.destroy(new Error('upstream timeout'));
     finish(new Error('upstream timeout'));
@@ -96,12 +122,83 @@ function relayOnce(base, method, queryString, body, cb) {
   req.end();
 }
 
+function relayOnceH2(url, method, queryString, body, cb) {
+  let done = false;
+  let timer;
+  let req;
+  let status = null;
+  const chunks = [];
+  let size = 0;
+  const finish = (err, statusCode, data) => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    cb(err, statusCode, data);
+  };
+
+  try {
+    const session = getSession(url);
+    const headers = {
+      ':method': method,
+      ':path': url.pathname + (queryString ? '?' + queryString : ''),
+      ':authority': url.host,
+      accept: 'application/dns-message',
+      'user-agent': `infrlo-doh-relay/${VERSION}`,
+    };
+    if (method === 'POST') {
+      headers['content-type'] = 'application/dns-message';
+      headers['content-length'] = body ? body.length : 0;
+    }
+    req = session.request(headers);
+  } catch (err) {
+    return cb(err);
+  }
+
+  req.on('response', (responseHeaders) => {
+    status = responseHeaders[':status'];
+  });
+  req.on('data', (chunk) => {
+    size += chunk.length;
+    if (size > MAX_BODY) {
+      try {
+        req.close(http2.constants.NGHTTP2_CANCEL);
+      } catch {}
+      finish(new Error('upstream body too large'));
+      return;
+    }
+    chunks.push(chunk);
+  });
+  req.on('end', () => finish(null, status, Buffer.concat(chunks)));
+  req.on('error', (err) => finish(err));
+
+  timer = setTimeout(() => {
+    try {
+      req.close(http2.constants.NGHTTP2_CANCEL);
+    } catch {}
+    finish(new Error('upstream timeout'));
+  }, UPSTREAM_TIMEOUT_MS);
+
+  if (body) req.write(body);
+  req.end();
+}
+
+function relayOnce(url, method, queryString, body, cb) {
+  if (url.protocol === 'http:') return relayOnceH1(url, method, queryString, body, cb);
+  return relayOnceH2(url, method, queryString, body, cb);
+}
+
 function relay(method, queryString, body, queryId, cb) {
   const upstreams = orderedUpstreams();
   const attempt = (index) => {
     if (index >= upstreams.length) return cb(new Error('all upstreams failed'));
     const upstream = upstreams[index];
-    relayOnce(upstream, method, queryString, body, (err, status, data) => {
+    let url;
+    try {
+      url = new URL(upstream);
+    } catch {
+      return attempt(index + 1);
+    }
+    relayOnce(url, method, queryString, body, (err, status, data) => {
       if (!err && status >= 200 && status < 300 && isValidAnswer(data, queryId)) {
         const preferred = UPSTREAMS.indexOf(upstream);
         if (preferred >= 0) preferredUpstream = preferred;
@@ -167,6 +264,15 @@ function readBody(req, cb) {
   req.on('error', (err) => cb(err));
 }
 
+function applyEcs(query) {
+  if (!ECS_DATA) return query;
+  try {
+    return injectEcs(query, ECS_DATA);
+  } catch {
+    return query;
+  }
+}
+
 function handle(req, res) {
   const url = new URL(req.url, 'http://localhost');
   const started = Date.now();
@@ -183,6 +289,7 @@ function handle(req, res) {
         uptime: Math.round(process.uptime()),
         upstreams: UPSTREAMS.length,
         auth: Boolean(DOH_TOKEN),
+        ecs: ECS_DATA ? ECS_CIDR : 'off',
       }),
       'application/json; charset=utf-8',
     );
@@ -225,12 +332,13 @@ function handle(req, res) {
       log(400);
       return send(res, 400, 'missing dns parameter\n');
     }
-    const query = Buffer.from(dns, 'base64url');
-    if (query.length < 12) {
+    const original = Buffer.from(dns, 'base64url');
+    if (original.length < 12) {
       log(400);
       return send(res, 400, 'bad dns message\n');
     }
-    return relay('GET', 'dns=' + encodeURIComponent(dns), null, query.readUInt16BE(0), reply);
+    const query = applyEcs(original);
+    return relay('GET', 'dns=' + query.toString('base64url'), null, query.readUInt16BE(0), reply);
   }
 
   if (req.method === 'POST') {
@@ -248,7 +356,8 @@ function handle(req, res) {
         log(400);
         return send(res, 400, 'bad dns message\n');
       }
-      relay('POST', '', body, body.readUInt16BE(0), reply);
+      const query = applyEcs(body);
+      relay('POST', '', query, query.readUInt16BE(0), reply);
     });
   }
 
@@ -279,6 +388,11 @@ setInterval(() => {
 
 for (const signal of ['SIGTERM', 'SIGINT']) {
   process.on(signal, () => {
+    for (const session of sessions.values()) {
+      try {
+        session.close();
+      } catch {}
+    }
     server.close(() => process.exit(0));
     setTimeout(() => {
       if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
@@ -292,6 +406,7 @@ server.listen(PORT, '0.0.0.0', () => {
   const actualPort = address && typeof address === 'object' ? address.port : PORT;
   console.log(`infrlo-doh-relay v${VERSION} listening on 0.0.0.0:${actualPort}`);
   console.log(`upstreams: ${UPSTREAMS.join(', ')}`);
+  console.log(`ecs: ${ECS_DATA ? ECS_CIDR : 'off'}`);
   if (DOH_TOKEN) console.log('token auth: enabled');
   if (RATE_LIMIT_PER_MIN) console.log(`rate limit: ${RATE_LIMIT_PER_MIN}/min per IP`);
 });

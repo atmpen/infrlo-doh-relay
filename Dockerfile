@@ -1,10 +1,11 @@
 FROM node:20-alpine
 
 LABEL org.opencontainers.image.title="infrlo-doh-relay" \
-      org.opencontainers.image.version="1.1.1"
+      org.opencontainers.image.version="1.2.0"
 
 WORKDIR /app
 COPY --chown=node:node package.json server.js ./
+COPY --chown=node:node lib ./lib
 
 ENV PORT=5000
 EXPOSE 5000

@@ -3,11 +3,14 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import http2 from 'node:http2';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import ecs from '../lib/ecs.js';
 
+const { buildEcsData, injectEcs } = ecs;
 const here = path.dirname(fileURLToPath(import.meta.url));
 const serverPath = path.join(here, '..', 'server.js');
 const ANSWER_IP = '203.0.113.7';
@@ -54,11 +57,6 @@ function buildAnswer(query, ip = ANSWER_IP, idOffset = 0) {
 function startMock({ idOffset = 0 } = {}) {
   const requests = [];
   const server = http.createServer((req, res) => {
-    requests.push({
-      method: req.method,
-      contentLength: req.headers['content-length'],
-      contentType: req.headers['content-type'],
-    });
     const chunks = [];
     req.on('data', (chunk) => chunks.push(chunk));
     req.on('end', () => {
@@ -69,6 +67,12 @@ function startMock({ idOffset = 0 } = {}) {
       } else {
         query = Buffer.concat(chunks);
       }
+      requests.push({
+        method: req.method,
+        contentLength: req.headers['content-length'],
+        contentType: req.headers['content-type'],
+        query: Buffer.from(query),
+      });
       const answer = buildAnswer(query, ANSWER_IP, idOffset);
       res.writeHead(200, {
         'content-type': 'application/dns-message',
@@ -82,6 +86,105 @@ function startMock({ idOffset = 0 } = {}) {
       resolve({ server, port: server.address().port, requests });
     });
   });
+}
+
+function startH2Mock() {
+  const server = http2.createServer();
+  server.on('stream', (stream) => {
+    const chunks = [];
+    stream.on('data', (chunk) => chunks.push(chunk));
+    stream.on('end', () => {
+      const query = Buffer.concat(chunks);
+      const answer = buildAnswer(query, ANSWER_IP, 0);
+      stream.respond({
+        ':status': 200,
+        'content-type': 'application/dns-message',
+        'content-length': answer.length,
+      });
+      stream.end(answer);
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      resolve({ server, port: server.address().port });
+    });
+  });
+}
+
+function skipName(buf, off) {
+  while (true) {
+    const len = buf[off];
+    if (len === undefined) throw new Error('truncated name');
+    if (len === 0) return off + 1;
+    if ((len & 0xc0) === 0xc0) return off + 2;
+    off += 1 + len;
+  }
+}
+
+function parseOpt(query) {
+  const qd = query.readUInt16BE(4);
+  const an = query.readUInt16BE(6);
+  const ns = query.readUInt16BE(8);
+  const ar = query.readUInt16BE(10);
+  let off = 12;
+  for (let i = 0; i < qd; i++) {
+    off = skipName(query, off);
+    off += 4;
+  }
+  for (let i = 0; i < an + ns; i++) {
+    off = skipName(query, off);
+    const rdlen = query.readUInt16BE(off + 8);
+    off += 10 + rdlen;
+  }
+  for (let i = 0; i < ar; i++) {
+    off = skipName(query, off);
+    const type = query.readUInt16BE(off);
+    const udpSize = query.readUInt16BE(off + 2);
+    const ttl = query.readUInt32BE(off + 4);
+    const rdlen = query.readUInt16BE(off + 8);
+    const rdata = query.subarray(off + 10, off + 10 + rdlen);
+    if (type === 41) return { udpSize, ttl, rdata };
+    off += 10 + rdlen;
+  }
+  return null;
+}
+
+function findEcs(query) {
+  const opt = parseOpt(query);
+  if (!opt) return null;
+  let off = 0;
+  while (off + 4 <= opt.rdata.length) {
+    const code = opt.rdata.readUInt16BE(off);
+    const len = opt.rdata.readUInt16BE(off + 2);
+    const data = opt.rdata.subarray(off + 4, off + 4 + len);
+    if (code === 8 && data.length >= 4) {
+      return {
+        family: data.readUInt16BE(0),
+        source: data[2],
+        scope: data[3],
+        address: [...data.subarray(4)],
+      };
+    }
+    off += 4 + len;
+  }
+  return null;
+}
+
+function buildQueryWithOpt(name, ecsCidr, doBit = true) {
+  const query = buildQuery(name);
+  query.writeUInt16BE(1, 10);
+  const ecsData = buildEcsData(ecsCidr);
+  const rdata = Buffer.alloc(4 + ecsData.length);
+  rdata.writeUInt16BE(8, 0);
+  rdata.writeUInt16BE(ecsData.length, 2);
+  ecsData.copy(rdata, 4);
+  const head = Buffer.alloc(11);
+  head[0] = 0;
+  head.writeUInt16BE(41, 1);
+  head.writeUInt16BE(1232, 3);
+  head.writeUInt32BE(doBit ? 0x8000 : 0, 5);
+  head.writeUInt16BE(rdata.length, 9);
+  return Buffer.concat([query, head, rdata]);
 }
 
 async function closedPort() {
@@ -162,7 +265,7 @@ test('health endpoint reports the version', async () => {
     assert.equal(response.status, 200);
     const body = await response.json();
     assert.equal(body.status, 'ok');
-    assert.equal(body.version, '1.1.1');
+    assert.equal(body.version, '1.2.0');
   } finally {
     await stopRelay(relay.child);
   }
@@ -177,7 +280,8 @@ test('POST DoH query returns the upstream answer', async () => {
     assert.equal(response.headers.get('content-type'), 'application/dns-message');
     assertAnswer(Buffer.from(await response.arrayBuffer()), query);
     // Cloudflare rejects a chunked POST, so the relay must send a length.
-    assert.equal(mock.requests.at(-1).contentLength, String(query.length));
+    const received = mock.requests.at(-1);
+    assert.equal(received.contentLength, String(received.query.length));
   } finally {
     await stopRelay(relay.child);
   }
@@ -279,6 +383,79 @@ test('rejects an answer with a mismatched DNS id', async () => {
     assert.equal(response.status, 502);
   } finally {
     await stopRelay(relay.child);
+  }
+});
+
+test('injectEcs replaces an existing ECS and keeps the DO bit', () => {
+  const original = buildQueryWithOpt('example.com', '8.8.8.0/24', true);
+  const injected = injectEcs(original, buildEcsData('221.176.1.0/24'));
+  const opt = parseOpt(injected);
+  assert.equal(opt.ttl & 0x8000, 0x8000, 'DO bit preserved');
+  assert.deepEqual(findEcs(injected), {
+    family: 1,
+    source: 24,
+    scope: 0,
+    address: [221, 176, 1],
+  });
+  assert.equal(injected.readUInt16BE(10), 1, 'one additional record');
+
+  let count = 0;
+  let off = 0;
+  while (off + 4 <= opt.rdata.length) {
+    const code = opt.rdata.readUInt16BE(off);
+    const len = opt.rdata.readUInt16BE(off + 2);
+    if (code === 8) count += 1;
+    off += 4 + len;
+  }
+  assert.equal(count, 1, 'the old ECS option is gone');
+});
+
+test('relay injects the configured ECS into the upstream query', async () => {
+  const relay = await startRelay({ DOH_UPSTREAMS: mockUpstream, DOH_ECS: '221.176.1.0/24' });
+  try {
+    const query = buildQuery('example.com');
+    const response = await dohPost(relay.base, query);
+    assert.equal(response.status, 200);
+    const received = mock.requests.at(-1).query;
+    assert.deepEqual(findEcs(received), {
+      family: 1,
+      source: 24,
+      scope: 0,
+      address: [221, 176, 1],
+    });
+    assert.equal(received.readUInt16BE(10), 1);
+  } finally {
+    await stopRelay(relay.child);
+  }
+});
+
+test('DOH_ECS=off leaves the query untouched', async () => {
+  const relay = await startRelay({ DOH_UPSTREAMS: mockUpstream, DOH_ECS: 'off' });
+  try {
+    const query = buildQuery('example.com');
+    const response = await dohPost(relay.base, query);
+    assert.equal(response.status, 200);
+    const received = mock.requests.at(-1).query;
+    assert.equal(findEcs(received), null);
+    assert.equal(received.readUInt16BE(10), 0);
+  } finally {
+    await stopRelay(relay.child);
+  }
+});
+
+test('uses HTTP/2 for http2:// upstreams', async () => {
+  const h2mock = await startH2Mock();
+  const relay = await startRelay({
+    DOH_UPSTREAMS: `http2://127.0.0.1:${h2mock.port}/dns-query`,
+  });
+  try {
+    const query = buildQuery('example.com');
+    const response = await dohPost(relay.base, query);
+    assert.equal(response.status, 200);
+    assertAnswer(Buffer.from(await response.arrayBuffer()), query);
+  } finally {
+    await stopRelay(relay.child);
+    h2mock.server.close();
   }
 });
 
