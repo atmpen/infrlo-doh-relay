@@ -233,7 +233,7 @@
       <div class="card"><div class="k">成功率</div><div class="v" id="success">—</div><div class="hint" id="errors">—</div></div>
       <div class="card"><div class="k">ECS</div><div class="v small" id="ecs">—</div><div class="hint"><span id="ecs-hint">固定客户端网段</span> · <button id="ecs-edit" type="button" class="link">编辑</button></div></div>
       <div class="card"><div class="k">上游</div><div class="v" id="upstream-count">—</div><div class="hint">并行竞速</div></div>
-      <div class="card"><div class="k">限流</div><div class="v small" id="rate-limit">—</div><div class="hint">按客户端 IP</div></div>
+      <div class="card"><div class="k">限流</div><div class="v small" id="rate-limit">—</div><div class="hint" id="rate-limit-hint">按客户端 IP</div></div>
       <div class="card"><div class="k">内存</div><div class="v small" id="memory">—</div><div class="hint" id="platform">—</div></div>
     </section>
 
@@ -344,6 +344,10 @@
     $('login-view').hidden = false;
     $('dashboard-view').hidden = true;
     $('lock-btn').hidden = true;
+    // Do not leave a typed DoH token in a hidden dialog after the session dies.
+    $('copy-modal').hidden = true;
+    $('token-input').value = '';
+    $('ecs-modal').hidden = true;
     setPill(null, '未解锁');
   };
   const showDashboard = () => {
@@ -368,9 +372,10 @@
     $('started').textContent = `启动于 ${fmtTime(data.startedAt)}`;
     $('requests').textContent = data.stats.dohRequests;
     $('last-request').textContent = data.stats.lastRequestAt ? `最近 ${fmtTime(data.stats.lastRequestAt)}` : '暂无查询';
-    const rate = data.stats.dohRequests ? Math.round((data.stats.dohOk / data.stats.dohRequests) * 100) : null;
+    const handled = data.stats.dohOk + data.stats.dohErrors;
+    const rate = handled ? Math.round((data.stats.dohOk / handled) * 100) : null;
     $('success').textContent = rate == null ? '—' : `${rate}%`;
-    $('errors').textContent = `${data.stats.dohErrors} 上游错误 · ${data.stats.authFailures} 鉴权失败`;
+    $('errors').textContent = `${data.stats.dohErrors} 上游错误 · ${data.stats.authFailures} 鉴权失败 · ${data.stats.clientClosed ?? 0} 中断`;
     if (data.ecsMode === 'passthrough') {
       $('ecs').textContent = '透传';
       $('ecs-hint').textContent = '客户端 ECS 原样转发';
@@ -380,6 +385,9 @@
     }
     $('upstream-count').textContent = data.upstreams.length;
     $('rate-limit').textContent = data.rateLimitPerMin ? `${data.rateLimitPerMin}/分钟` : '关闭';
+    $('rate-limit-hint').textContent = data.maxInflight
+      ? `按 IP · 并发 ${data.inflight}/${data.maxInflight}`
+      : '按客户端 IP';
     $('memory').textContent = `${fmtBytes(data.memory.rss)} RSS`;
     $('platform').textContent = `平台 ${data.platform}`;
     $('masked-url').textContent = `${location.origin}/••••••••/${data.suffix}`;

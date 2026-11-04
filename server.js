@@ -1,6 +1,6 @@
 'use strict';
 
-// Infrlo DoH relay — v1.8.0
+// Infrlo DoH relay — v1.9.0
 // RFC 8484 DNS-over-HTTPS relay. Infrlo expects the app on 0.0.0.0:5000.
 // Dependency-free on purpose: the platform only needs `node server.js`.
 
@@ -8,10 +8,11 @@ const http = require('node:http');
 const http2 = require('node:http2');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
+const net = require('node:net');
 const path = require('node:path');
 const { buildEcsData, injectEcs } = require('./lib/ecs');
 
-const VERSION = '1.8.0';
+const VERSION = '1.9.0';
 const PORT = process.env.PORT === undefined || process.env.PORT === ''
   ? 5000
   : Number(process.env.PORT);
@@ -25,7 +26,8 @@ const DOH_TOKEN = (process.env.DOH_TOKEN || '').trim();
 // The DoH URL is /<DOH_TOKEN>/<DOH_SUFFIX>; the suffix is one path segment.
 const DOH_SUFFIX = (process.env.DOH_SUFFIX || 'weduolijia').trim().replace(/^\/+|\/+$/g, '');
 // Homepage password; defaults to the DoH token when not set separately.
-const WEB_PASSWORD = (process.env.WEB_PASSWORD || DOH_TOKEN).trim();
+// A blank or whitespace-only value must not become an empty password.
+const WEB_PASSWORD = (process.env.WEB_PASSWORD || '').trim() || DOH_TOKEN;
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 if (!DOH_TOKEN) {
   console.error('DOH_TOKEN is required; refusing to start an unauthenticated relay.');
@@ -41,11 +43,17 @@ const RATE_LIMIT_PER_MIN = process.env.RATE_LIMIT_PER_MIN === undefined
   : Math.max(0, Number(process.env.RATE_LIMIT_PER_MIN) || 0);
 const UPSTREAM_TIMEOUT_MS = Math.max(500, Number(process.env.UPSTREAM_TIMEOUT_MS) || 3000);
 const MAX_BODY = 65535;
+// Concurrency cap so a burst cannot buffer an unbounded number of upstream
+// responses (each up to MAX_BODY). 0 disables the cap.
+const MAX_INFLIGHT = process.env.MAX_INFLIGHT === undefined
+  ? 256
+  : Math.max(0, Number(process.env.MAX_INFLIGHT) || 0);
 // ECS mode: custom injects ECS_CIDR; passthrough forwards the client's ECS.
 // ENV values are the defaults; the dashboard can override them at runtime and
 // the override is stored in ECS_FILE (takes precedence on restart).
 const ENV_ECS = process.env.DOH_ECS === undefined ? '111.8.1.0/24' : process.env.DOH_ECS.trim();
-const ENV_ECS_MODE = process.env.ECS_MODE === 'passthrough' || /^(off|none|0)$/i.test(ENV_ECS)
+const ENV_ECS_MODE = String(process.env.ECS_MODE || '').trim().toLowerCase() === 'passthrough'
+  || /^(off|none|0)$/i.test(ENV_ECS)
   ? 'passthrough'
   : 'custom';
 const ECS_FILE = process.env.ECS_FILE === undefined
@@ -135,16 +143,30 @@ const stats = {
   dohErrors: 0,
   authFailures: 0,
   rateLimited: 0,
+  overloaded: 0,
+  clientClosed: 0,
   lastRequestAt: null,
 };
+let inflight = 0;
+
+// Parse and deduplicate upstreams once at startup. Invalid entries are skipped
+// instead of throwing on every request, and the request path avoids allocating
+// a Set and new URL objects per query.
+const UPSTREAM_ENTRIES = [];
 const upstreamStats = new Map();
-for (const upstream of new Set(UPSTREAMS)) {
-  let host = upstream;
+for (const raw of new Set(UPSTREAMS)) {
+  let url;
   try {
-    host = new URL(upstream).host;
-  } catch {}
-  upstreamStats.set(upstream, {
-    host,
+    url = new URL(raw);
+    if (!['http:', 'http2:', 'https:'].includes(url.protocol)) {
+      throw new Error(`unsupported protocol ${url.protocol}`);
+    }
+  } catch (err) {
+    console.error(`skipping invalid upstream ${raw}: ${err.message}`);
+    continue;
+  }
+  const stat = {
+    host: url.host,
     attempts: 0,
     wins: 0,
     errors: 0,
@@ -153,7 +175,9 @@ for (const upstream of new Set(UPSTREAMS)) {
     lastRcode: null,
     lastError: null,
     lastAt: null,
-  });
+  };
+  UPSTREAM_ENTRIES.push({ raw, url, host: url.host, stat });
+  upstreamStats.set(raw, stat);
 }
 
 const STATUS_HTML = (() => {
@@ -183,6 +207,8 @@ function statusPayload() {
     suffix: DOH_SUFFIX,
     auth: true,
     rateLimitPerMin: RATE_LIMIT_PER_MIN,
+    maxInflight: MAX_INFLIGHT,
+    inflight,
     upstreamTimeoutMs: UPSTREAM_TIMEOUT_MS,
     dohPath: `/<token>/${DOH_SUFFIX}`,
     stats: { ...stats },
@@ -209,14 +235,53 @@ function getSession(url) {
   if (session && !session.closed && !session.destroyed) return session;
   const origin = url.protocol === 'http2:' ? `http://${url.host}` : `https://${url.host}`;
   const options = url.protocol === 'http2:' ? {} : { servername: url.hostname };
+  options.settings = { enablePush: false };
   session = http2.connect(origin, options);
+  let pingTimer = null;
+  let connectTimer = null;
   const drop = () => {
+    if (pingTimer) {
+      clearInterval(pingTimer);
+      pingTimer = null;
+    }
+    if (connectTimer) {
+      clearTimeout(connectTimer);
+      connectTimer = null;
+    }
     if (sessions.get(key) === session) sessions.delete(key);
   };
   session.on('close', drop);
   session.on('error', drop);
   session.on('goaway', drop);
+  session.once('connect', () => {
+    if (connectTimer) {
+      clearTimeout(connectTimer);
+      connectTimer = null;
+    }
+  });
   sessions.set(key, session);
+  // Do not let a half-open TLS connection keep a dead session in the pool.
+  connectTimer = setTimeout(() => {
+    if (!session.connecting) return;
+    try {
+      session.destroy(new Error('http2 connect timeout'));
+    } catch {}
+    drop();
+  }, 10_000);
+  connectTimer.unref();
+  // Idle sessions are routinely closed by the peer. A periodic PING keeps the
+  // TLS connection warm so the next query does not pay a fresh handshake.
+  pingTimer = setInterval(() => {
+    if (session.closed || session.destroyed) return drop();
+    try {
+      session.ping((err) => {
+        if (err) drop();
+      });
+    } catch {
+      drop();
+    }
+  }, 60_000);
+  pingTimer.unref();
   return session;
 }
 
@@ -351,88 +416,110 @@ function relayOnce(url, method, queryString, body, cb) {
 }
 
 function relay(method, queryString, body, queryId, cb) {
-  const upstreams = [...new Set(UPSTREAMS)];
-  if (upstreams.length === 0) return cb(new Error('no upstreams configured'));
+  if (UPSTREAM_ENTRIES.length === 0) {
+    cb(new Error('no upstreams configured'));
+    return { cancel() {} };
+  }
 
   const handles = [];
   let finished = false;
-  let pending = upstreams.length;
+  let pending = UPSTREAM_ENTRIES.length;
   let fallback = null;
 
-  const finish = (err, data, upstream) => {
+  const finish = (err, data, winner) => {
     if (finished) return;
     finished = true;
-    for (const handle of handles) {
+    for (const item of handles) {
+      // The winner already received its full response; sending a cancel frame
+      // for it would be pure overhead.
+      if (winner && item.entry === winner) continue;
       try {
-        handle.cancel();
+        item.handle.cancel();
       } catch {}
     }
-    const stat = upstream ? upstreamStats.get(upstream) : null;
-    if (stat) stat.wins += 1;
-    cb(err, data, upstream);
+    if (winner) winner.stat.wins += 1;
+    cb(err, data, winner);
   };
 
-  const onResult = (upstream, started, err, status, data) => {
+  const onResult = (entry, started, err, status, data) => {
     if (finished) return;
     pending -= 1;
     const valid = !err && status >= 200 && status < 300 && isValidAnswer(data, queryId);
-    const stat = upstreamStats.get(upstream);
-    if (stat) {
-      stat.lastStatus = status ?? null;
-      stat.lastRttMs = Date.now() - started;
-      stat.lastAt = new Date().toISOString();
-      if (err) {
-        stat.errors += 1;
-        stat.lastError = err.message || String(err);
-      } else if (!(status >= 200 && status < 300)) {
-        stat.errors += 1;
-        stat.lastError = `HTTP ${status}`;
-      } else if (valid) {
-        stat.lastRcode = data[3] & 0x0f;
-        stat.lastError = null;
-      } else {
-        stat.lastError = 'invalid DNS answer';
-      }
+    const stat = entry.stat;
+    stat.lastStatus = status ?? null;
+    stat.lastRttMs = Date.now() - started;
+    stat.lastAt = new Date().toISOString();
+    if (err) {
+      stat.errors += 1;
+      stat.lastError = err.message || String(err);
+    } else if (!(status >= 200 && status < 300)) {
+      stat.errors += 1;
+      stat.lastError = `HTTP ${status}`;
+    } else if (valid) {
+      stat.lastRcode = data[3] & 0x0f;
+      stat.lastError = null;
+    } else {
+      stat.lastError = 'invalid DNS answer';
     }
     if (valid) {
       const rcode = data[3] & 0x0f;
       // NOERROR and NXDOMAIN are useful answers; error rcodes are kept only
       // as a fallback when every upstream fails to produce a useful one.
       if (rcode === 0 || rcode === 3) {
-        finish(null, data, upstream);
+        finish(null, data, entry);
         return;
       }
-      if (!fallback) fallback = { data, upstream };
+      if (!fallback) fallback = { data, entry };
     }
     if (pending === 0) {
-      if (fallback) finish(null, fallback.data, fallback.upstream);
+      if (fallback) finish(null, fallback.data, fallback.entry);
       else finish(new Error('all upstreams failed'));
     }
   };
 
-  for (const upstream of upstreams) {
+  for (const entry of UPSTREAM_ENTRIES) {
     if (finished) break;
-    const stat = upstreamStats.get(upstream);
-    if (stat) stat.attempts += 1;
+    entry.stat.attempts += 1;
     const started = Date.now();
     try {
-      const url = new URL(upstream);
-      const handle = relayOnce(url, method, queryString, body, (err, status, data) => {
-        onResult(upstream, started, err, status, data);
+      const handle = relayOnce(entry.url, method, queryString, body, (err, status, data) => {
+        onResult(entry, started, err, status, data);
       });
-      if (handle) handles.push(handle);
+      if (handle) handles.push({ entry, handle });
     } catch (err) {
-      onResult(upstream, started, err, null, null);
+      onResult(entry, started, err, null, null);
     }
   }
+
+  return {
+    cancel() {
+      if (finished) return;
+      finished = true;
+      for (const item of handles) {
+        try {
+          item.handle.cancel();
+        } catch {}
+      }
+    },
+  };
 }
 
 function send(res, status, body, type, extraHeaders = {}) {
   if (res.writableEnded || res.destroyed) return;
+  const isWeb = type === 'text/html; charset=utf-8' || type === 'application/json; charset=utf-8';
   res.writeHead(status, {
     'content-type': type || 'text/plain; charset=utf-8',
     'content-length': Buffer.byteLength(body),
     'cache-control': 'no-store',
+    // DoH answers are binary and none of these change their handling, so keep
+    // them off the hot path.
+    ...(isWeb
+      ? {
+          'x-content-type-options': 'nosniff',
+          'referrer-policy': 'no-referrer',
+          'x-frame-options': 'DENY',
+        }
+      : {}),
     ...extraHeaders,
   });
   res.end(body);
@@ -441,7 +528,19 @@ function send(res, status, body, type, extraHeaders = {}) {
 function clientIp(req) {
   const forwarded = req.headers['x-forwarded-for'];
   if (typeof forwarded === 'string' && forwarded.trim()) {
-    return forwarded.split(',')[0].trim();
+    // The nearest proxy appends the address it saw as the last hop. Earlier
+    // entries are client-supplied, so taking the first one would let a caller
+    // rotate X-Forwarded-For and evade both rate limiting and password lockout.
+    const comma = forwarded.lastIndexOf(',');
+    const last = (comma >= 0 ? forwarded.slice(comma + 1) : forwarded).trim();
+    let address = last;
+    if (last.startsWith('[')) {
+      const end = last.indexOf(']');
+      if (end > 0) address = last.slice(1, end);
+    } else if (/^\d+(\.\d+){3}:\d+$/.test(last)) {
+      address = last.slice(0, last.lastIndexOf(':'));
+    }
+    if (address && net.isIP(address)) return address;
   }
   return req.socket.remoteAddress || 'unknown';
 }
@@ -472,6 +571,12 @@ function readBody(req, cb) {
   const chunks = [];
   let size = 0;
   let tooLarge = false;
+  let done = false;
+  const finish = (err, body) => {
+    if (done) return;
+    done = true;
+    cb(err, body);
+  };
   req.on('data', (chunk) => {
     size += chunk.length;
     if (size > MAX_BODY) {
@@ -480,8 +585,19 @@ function readBody(req, cb) {
     }
     chunks.push(chunk);
   });
-  req.on('end', () => cb(tooLarge ? new Error('request body too large') : null, Buffer.concat(chunks)));
-  req.on('error', (err) => cb(err));
+  req.on('end', () => {
+    if (tooLarge) {
+      const err = new Error('request body too large');
+      err.code = 'TOO_LARGE';
+      finish(err);
+      return;
+    }
+    finish(null, Buffer.concat(chunks));
+  });
+  req.on('error', (err) => finish(err));
+  // An upload cut off before 'end' needs no response: the client is gone and
+  // server.requestTimeout reaps the socket. Listening for 'close' here costs
+  // measurable throughput, so it stays off the hot path.
 }
 
 function readCookie(req, name) {
@@ -491,7 +607,11 @@ function readCookie(req, name) {
     const index = part.indexOf('=');
     if (index < 0) continue;
     if (part.slice(0, index).trim() === name) {
-      return decodeURIComponent(part.slice(index + 1).trim());
+      try {
+        return decodeURIComponent(part.slice(index + 1).trim());
+      } catch {
+        return null;
+      }
     }
   }
   return null;
@@ -515,7 +635,11 @@ function createSession() {
 }
 
 function setSessionCookie(req, res, id, maxAgeSec = Math.floor(SESSION_TTL_MS / 1000)) {
-  const secure = req.headers['x-forwarded-proto'] === 'https' || Boolean(req.socket.encrypted);
+  const proto = String(req.headers['x-forwarded-proto'] || '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  const secure = proto === 'https' || Boolean(req.socket.encrypted);
   const parts = [
     `idr_session=${id}`,
     'HttpOnly',
@@ -543,6 +667,8 @@ function noteWebFailure(ip) {
 }
 
 function readJson(req, cb) {
+  const type = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+  if (type !== 'application/json') return cb(new Error('bad content type'));
   readBody(req, (err, body) => {
     if (err) return cb(err);
     try {
@@ -655,7 +781,7 @@ function handle(req, res) {
         status: 'ok',
         version: VERSION,
         uptime: Math.round(process.uptime()),
-        upstreams: UPSTREAMS.length,
+        upstreams: UPSTREAM_ENTRIES.length,
         auth: true,
         suffix: DOH_SUFFIX,
         ecs: ECS_MODE === 'passthrough' ? 'passthrough' : ECS_CIDR,
@@ -686,9 +812,6 @@ function handle(req, res) {
     return send(res, 404, 'not found\n');
   }
 
-  stats.dohRequests += 1;
-  stats.lastRequestAt = new Date().toISOString();
-
   let token;
   try {
     token = decodeURIComponent(segments[0]);
@@ -703,7 +826,7 @@ function handle(req, res) {
     return send(res, 401, 'unauthorized\n');
   }
 
-  if (rateLimited(clientIp(req))) {
+  if (RATE_LIMIT_PER_MIN && rateLimited(clientIp(req))) {
     stats.rateLimited += 1;
     return send(res, 429, 'rate limited\n', 'text/plain; charset=utf-8', { 'retry-after': '60' });
   }
@@ -712,15 +835,55 @@ function handle(req, res) {
     console.log(`${req.method} ${displayPath} ${status} ${Date.now() - started}ms${extra}`);
   };
 
-  const reply = (err, data, upstream) => {
+  const reply = (err, data, entry) => {
     if (err) {
       stats.dohErrors += 1;
       log(502, ` (${err.message})`);
       return send(res, 502, 'upstream error\n');
     }
     stats.dohOk += 1;
-    log(200, upstream ? ` via ${new URL(upstream).hostname}` : '');
+    log(200, entry ? ` via ${entry.host}` : '');
     send(res, 200, data, 'application/dns-message');
+  };
+
+  let activeRelay = null;
+  let replied = false;
+  let counted = false;
+  const release = () => {
+    if (!counted) return;
+    counted = false;
+    inflight -= 1;
+  };
+  const onClose = () => {
+    if (replied) return;
+    replied = true;
+    if (activeRelay) activeRelay.cancel();
+    release();
+    stats.clientClosed += 1;
+  };
+  const finishReply = (err, data, entry) => {
+    if (replied) return;
+    replied = true;
+    res.removeListener('close', onClose);
+    release();
+    reply(err, data, entry);
+  };
+  const startRelay = (method, queryString, body, query) => {
+    if (MAX_INFLIGHT && inflight >= MAX_INFLIGHT) {
+      stats.overloaded += 1;
+      log(503);
+      return send(res, 503, 'relay busy\n', 'text/plain; charset=utf-8', { 'retry-after': '1' });
+    }
+    stats.dohRequests += 1;
+    stats.lastRequestAt = new Date().toISOString();
+    inflight += 1;
+    counted = true;
+    res.on('close', onClose);
+    try {
+      activeRelay = relay(method, queryString, body, query.readUInt16BE(0), finishReply);
+    } catch (err) {
+      finishReply(err);
+    }
   };
 
   if (req.method === 'GET') {
@@ -735,7 +898,7 @@ function handle(req, res) {
       return send(res, 400, 'bad dns message\n');
     }
     const query = applyEcs(original);
-    return relay('GET', 'dns=' + query.toString('base64url'), null, query.readUInt16BE(0), reply);
+    return startRelay('GET', 'dns=' + query.toString('base64url'), null, query);
   }
 
   if (req.method === 'POST') {
@@ -744,17 +907,28 @@ function handle(req, res) {
       log(415);
       return send(res, 415, 'expected application/dns-message\n');
     }
+    const declared = Number(req.headers['content-length']);
+    if (Number.isFinite(declared) && declared > MAX_BODY) {
+      req.resume();
+      log(413);
+      return send(res, 413, 'request body too large\n');
+    }
     return readBody(req, (err, body) => {
       if (err) {
-        log(400);
-        return send(res, 400, 'bad request body\n');
+        const tooLarge = err.code === 'TOO_LARGE';
+        log(tooLarge ? 413 : 400);
+        return send(
+          res,
+          tooLarge ? 413 : 400,
+          tooLarge ? 'request body too large\n' : 'bad request body\n',
+        );
       }
       if (body.length < 12) {
         log(400);
         return send(res, 400, 'bad dns message\n');
       }
       const query = applyEcs(body);
-      relay('POST', '', query, query.readUInt16BE(0), reply);
+      startRelay('POST', '', query, query);
     });
   }
 
@@ -809,8 +983,23 @@ server.listen(PORT, '0.0.0.0', () => {
   const actualPort = address && typeof address === 'object' ? address.port : PORT;
   console.log(`infrlo-doh-relay v${VERSION} listening on 0.0.0.0:${actualPort}`);
   console.log(`doh path: /<token>/${DOH_SUFFIX}`);
-  console.log(`upstreams: ${UPSTREAMS.join(', ')}`);
+  console.log(`upstreams: ${UPSTREAM_ENTRIES.length ? UPSTREAM_ENTRIES.map((entry) => entry.raw).join(', ') : '(none)'}`);
   console.log(`ecs: ${ECS_MODE === 'passthrough' ? 'passthrough' : ECS_CIDR}`);
   console.log('token auth: required');
   if (RATE_LIMIT_PER_MIN) console.log(`rate limit: ${RATE_LIMIT_PER_MIN}/min per IP`);
+  if (MAX_INFLIGHT) console.log(`max inflight: ${MAX_INFLIGHT}`);
+  // Warm the TLS/HTTP2 sessions so the first real query does not pay for a
+  // handshake. Failures are harmless: getSession drops the dead session and the
+  // next query reconnects.
+  const warmed = [];
+  for (const entry of UPSTREAM_ENTRIES) {
+    if (entry.url.protocol === 'http:') continue;
+    try {
+      getSession(entry.url);
+      warmed.push(entry.host);
+    } catch (err) {
+      console.error(`preconnect ${entry.host} failed: ${err.message}`);
+    }
+  }
+  if (warmed.length) console.log(`preconnected: ${warmed.join(', ')}`);
 });

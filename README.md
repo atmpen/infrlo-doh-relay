@@ -1,6 +1,6 @@
 # infrlo-doh-relay
 
-v1.8.0 — a dependency-free [RFC 8484](https://www.rfc-editor.org/rfc/rfc8484) DNS-over-HTTPS relay, made for [Infrlo](https://infrlo.com/).
+v1.9.0 — a dependency-free [RFC 8484](https://www.rfc-editor.org/rfc/rfc8484) DNS-over-HTTPS relay, made for [Infrlo](https://infrlo.com/).
 
 It accepts DoH queries on `/<DOH_TOKEN>/weduolijia`, applies the configured ECS policy (inject a fixed subnet, or pass the client's own ECS through), forwards the DNS wire message over HTTP/2, and returns the answer unchanged. The root URL serves a live status dashboard. No cache, no query logging, no npm dependencies.
 
@@ -27,7 +27,7 @@ The server listens on `0.0.0.0:5000` (`PORT` overrides), which is what Infrlo ex
 Open `https://<your-app-domain>/`. The page is in Chinese and starts with a password gate:
 
 - `WEB_PASSWORD` (defaults to `DOH_TOKEN`) unlocks the dashboard for 12 hours with an HttpOnly, SameSite=Strict session cookie.
-- The dashboard shows version, uptime, Node runtime, memory, DoH request/success counters, ECS, rate limit, and per-upstream attempts/wins/errors/last RTT/last rcode.
+- The dashboard shows version, uptime, Node runtime, memory, the authenticated DoH request count, relay success rate (finished exchanges that reached an upstream answer), in-flight concurrency against `MAX_INFLIGHT`, ECS, rate limit, and per-upstream attempts/wins/errors/last RTT/last rcode.
 - The DNS endpoint is displayed with the token masked: `https://<app-domain>/••••••••/weduolijia`.
 - Clicking 复制 opens a DoH token prompt. The server validates the token; on success the browser copies the full URL to the clipboard, on failure it shows a warning.
 - The ECS card shows either the injected subnet or 透传, with an 编辑 button. The editor has a mode selector:
@@ -52,7 +52,7 @@ In the Infrlo dashboard, **Deploy → From Public URL** and use:
 
 Set `DOH_TOKEN` to your secret in the environment variables section. **The relay refuses to start without it** — this is deliberate, so it cannot accidentally run as an open resolver. Optionally set `WEB_PASSWORD` to use a different password for the dashboard; if omitted, the homepage password is the DoH token.
 
-Then open `https://<your-app-domain>/health`; it should return JSON with `"version":"1.8.0"`.
+Then open `https://<your-app-domain>/health`; it should return JSON with `"version":"1.9.0"`.
 
 The `Dockerfile` is included for platforms that build images directly. It pins Node 20 and runs as the non-root `node` user.
 
@@ -77,6 +77,7 @@ The `Dockerfile` is included for platforms that build images directly. It pins N
 | `ECS_FILE` | `data/ecs.txt` | File written by the dashboard's ECS editor as `{"mode":"custom","ecs":"…"}`. When present and readable, it takes precedence over `ECS_MODE`/`DOH_ECS` on restart. Legacy plain-text files (`<cidr>` or `off`) are still accepted. Set it to an empty string to disable persistence. |
 | `DOH_UPSTREAMS` | Quad9 dns11, Google | Comma-separated DoH URLs; all queried in parallel. |
 | `RATE_LIMIT_PER_MIN` | `600` | Per-IP requests per minute. `0` disables the limiter. |
+| `MAX_INFLIGHT` | `256` | Maximum concurrent DoH queries doing upstream work. Excess requests get `503` with `Retry-After: 1`. `0` disables the cap. |
 | `UPSTREAM_TIMEOUT_MS` | `3000` | Per-upstream timeout before trying the next one. |
 
 Use a URL-safe token (letters, digits, `-`, `_`). If it contains characters that are special in a URL, percent-encode them in the path.
@@ -97,6 +98,16 @@ Racing optimizes latency, not ECS quality: whichever upstream answers first wins
 The default ECS is `111.8.1.0/24` (Hunan Mobile, Changsha, AS56047). Change it with `DOH_ECS`, for example `221.176.1.0/24` (Beijing Mobile) or `120.196.1.0/24` (Shanghai Mobile). Set `ECS_MODE=passthrough` (or the legacy `DOH_ECS=off`) to forward the client's own ECS untouched.
 
 In `custom` mode the relay replaces any ECS the client sent and preserves other EDNS options (including the DNSSEC DO bit). In `passthrough` mode the query is forwarded exactly as received.
+
+## Performance and overload behavior
+
+- Upstream URLs are parsed and deduplicated once at startup; invalid entries are skipped with a log line instead of failing every request.
+- HTTP/2 sessions are pooled per origin, preconnected at startup, and kept warm with a PING every minute, so idle traffic does not pay a fresh TLS handshake on every query.
+- All upstreams are raced in parallel and loser streams are canceled as soon as a NOERROR/NXDOMAIN answer wins. The winner's stream is not canceled again.
+- If the DoH client disconnects, its upstream requests are canceled immediately, so abandoned queries do not keep buffering responses.
+- `MAX_INFLIGHT` bounds concurrent upstream work. Further requests get `503` and `Retry-After: 1`; service resumes as soon as in-flight work drains.
+- DoH bodies larger than 64 KiB are rejected with `413` without buffering more than 64 KiB.
+- Rate limiting and dashboard lockouts use the rightmost `X-Forwarded-For` entry — the hop appended by the nearest proxy. Client-supplied earlier entries cannot rotate around the limiter. If the relay is exposed directly rather than behind a proxy, strip client-supplied forwarding headers at the edge.
 
 ## Use with mihomo
 
@@ -136,7 +147,7 @@ The tests do not need internet access. The relay accepts `http://` and `http2://
 
 ## Notes
 
-- The relay does not cache. DNS caching stays with the client, which is what you want for a resolver path.
+- The relay does not cache. DNS caching stays with the client; this keeps the relay stateless and avoids serving records past their TTL. mihomo already caches, so a relay cache would mostly add staleness risk.
 - Request logs contain method, path, status and latency only. The token path segment is logged as `[redacted]`; query names are never logged.
 - All configured upstreams are raced in parallel. The first useful answer (NOERROR or NXDOMAIN) wins; the losing requests are canceled. SERVFAIL, REFUSED, and FORMERR responses are kept only as a fallback when no upstream produces a useful answer.
 - The upstream answer must echo the query ID and have the QR bit set; otherwise it is ignored by the race.

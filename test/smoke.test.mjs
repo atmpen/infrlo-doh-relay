@@ -69,11 +69,16 @@ function startMock({ idOffset = 0, ip = ANSWER_IP, delayMs = 0 } = {}) {
       } else {
         query = Buffer.concat(chunks);
       }
-      requests.push({
+      const record = {
         method: req.method,
         contentLength: req.headers['content-length'],
         contentType: req.headers['content-type'],
         query: Buffer.from(query),
+        aborted: false,
+      };
+      requests.push(record);
+      res.on('close', () => {
+        if (!res.writableEnded) record.aborted = true;
       });
       const respond = () => {
         if (res.writableEnded || res.destroyed) return;
@@ -272,7 +277,7 @@ test('health endpoint reports the version', async () => {
     assert.equal(response.status, 200);
     const body = await response.json();
     assert.equal(body.status, 'ok');
-    assert.equal(body.version, '1.8.0');
+    assert.equal(body.version, '1.9.0');
     assert.equal(body.ecs, '111.8.1.0/24');
     assert.equal(body.auth, true);
     assert.equal(body.suffix, TEST_SUFFIX);
@@ -334,7 +339,7 @@ test('locks the status API and reveals the URL only after token check', async ()
     const status = await fetch(relay.base + '/api/status', { headers: { cookie } });
     assert.equal(status.status, 200);
     const body = await status.json();
-    assert.equal(body.version, '1.8.0');
+    assert.equal(body.version, '1.9.0');
     assert.equal(body.auth, true);
     assert.equal(body.suffix, TEST_SUFFIX);
     assert.equal(body.stats.dohRequests, 1);
@@ -694,6 +699,127 @@ test('dashboard switches ECS between custom and passthrough', async () => {
     assert.equal(findEcs(await upstreamQuery(query)), null);
   } finally {
     await stopRelay(relay.child);
+  }
+});
+
+test('blank WEB_PASSWORD falls back to the DoH token', async () => {
+  const relay = await startRelay({ DOH_UPSTREAMS: mockUpstream, WEB_PASSWORD: '   ' });
+  try {
+    const unlock = await fetch(relay.base + '/api/unlock', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ password: TEST_TOKEN }),
+    });
+    assert.equal(unlock.status, 200);
+    await unlock.arrayBuffer();
+  } finally {
+    await stopRelay(relay.child);
+  }
+});
+
+test('rate limits on the proxy-appended X-Forwarded-For hop', async () => {
+  const relay = await startRelay({
+    DOH_UPSTREAMS: mockUpstream,
+    DOH_ECS: 'off',
+    RATE_LIMIT_PER_MIN: '2',
+  });
+  try {
+    const query = buildQuery('example.com');
+    const send = (first) =>
+      dohPost(relay.base, query, { 'x-forwarded-for': `${first}, 203.0.113.50` });
+    assert.equal((await send('10.0.0.1')).status, 200);
+    assert.equal((await send('10.0.0.2')).status, 200);
+    const limited = await send('10.0.0.3');
+    assert.equal(limited.status, 429);
+    await limited.arrayBuffer();
+  } finally {
+    await stopRelay(relay.child);
+  }
+});
+
+test('rejects an oversized POST body with 413', async () => {
+  const relay = await startRelay({ DOH_UPSTREAMS: mockUpstream, DOH_ECS: 'off' });
+  try {
+    const response = await fetch(`${relay.base}/${TEST_TOKEN}/${TEST_SUFFIX}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/dns-message' },
+      body: Buffer.alloc(70000),
+    });
+    assert.equal(response.status, 413);
+    await response.arrayBuffer();
+  } finally {
+    await stopRelay(relay.child);
+  }
+});
+
+test('caps concurrent upstream work and returns 503', async () => {
+  const slow = await startMock({ delayMs: 500 });
+  const relay = await startRelay({
+    DOH_UPSTREAMS: `http://127.0.0.1:${slow.port}/dns-query`,
+    DOH_ECS: 'off',
+    MAX_INFLIGHT: '1',
+  });
+  try {
+    const query = buildQuery('example.com');
+    const first = dohPost(relay.base, query);
+    const waitStart = Date.now();
+    while (slow.requests.length === 0 && Date.now() - waitStart < 2000) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(slow.requests.length, 1);
+
+    const second = await dohPost(relay.base, query);
+    assert.equal(second.status, 503);
+    assert.equal(second.headers.get('retry-after'), '1');
+    await second.arrayBuffer();
+
+    const firstResponse = await first;
+    assert.equal(firstResponse.status, 200);
+    await firstResponse.arrayBuffer();
+
+    const third = await dohPost(relay.base, query);
+    assert.equal(third.status, 200);
+    await third.arrayBuffer();
+  } finally {
+    await stopRelay(relay.child);
+    slow.server.closeAllConnections?.();
+    slow.server.close();
+  }
+});
+
+test('cancels upstream work when the client disconnects', async () => {
+  const slow = await startMock({ delayMs: 1000 });
+  const relay = await startRelay({
+    DOH_UPSTREAMS: `http://127.0.0.1:${slow.port}/dns-query`,
+    DOH_ECS: 'off',
+  });
+  try {
+    const query = buildQuery('example.com');
+    const controller = new AbortController();
+    const pending = fetch(`${relay.base}/${TEST_TOKEN}/${TEST_SUFFIX}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/dns-message' },
+      body: query,
+      signal: controller.signal,
+    }).catch(() => null);
+
+    const waitStart = Date.now();
+    while (slow.requests.length === 0 && Date.now() - waitStart < 2000) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(slow.requests.length, 1);
+
+    controller.abort();
+    await pending;
+    const waitClose = Date.now();
+    while (!slow.requests[0].aborted && Date.now() - waitClose < 2000) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(slow.requests[0].aborted, true);
+  } finally {
+    await stopRelay(relay.child);
+    slow.server.closeAllConnections?.();
+    slow.server.close();
   }
 });
 
