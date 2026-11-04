@@ -1,8 +1,8 @@
 # infrlo-doh-relay
 
-v1.4.0 — a dependency-free [RFC 8484](https://www.rfc-editor.org/rfc/rfc8484) DNS-over-HTTPS relay, made for [Infrlo](https://infrlo.com/).
+v1.5.0 — a dependency-free [RFC 8484](https://www.rfc-editor.org/rfc/rfc8484) DNS-over-HTTPS relay, made for [Infrlo](https://infrlo.com/).
 
-It accepts DoH queries on `/<DOH_TOKEN>/weduolijia`, injects a fixed EDNS Client Subnet (ECS) into every upstream query, forwards the DNS wire message over HTTP/2, and returns the answer unchanged. No cache, no query logging, no npm dependencies.
+It accepts DoH queries on `/<DOH_TOKEN>/weduolijia`, injects a fixed EDNS Client Subnet (ECS) into every upstream query, forwards the DNS wire message over HTTP/2, and returns the answer unchanged. The root URL serves a live status dashboard. No cache, no query logging, no npm dependencies.
 
 ## Endpoints
 
@@ -10,11 +10,24 @@ It accepts DoH queries on `/<DOH_TOKEN>/weduolijia`, injects a fixed EDNS Client
 | --- | --- | --- |
 | `POST` | `/<DOH_TOKEN>/weduolijia` | DoH query body (`content-type: application/dns-message`) |
 | `GET` | `/<DOH_TOKEN>/weduolijia?dns=<base64url>` | DoH query in the URL |
-| `GET` | `/health` | Version, uptime, upstream count, ECS state (public) |
+| `GET` | `/` | Live status dashboard (public, token never shown) |
+| `GET` | `/api/status` | JSON consumed by the dashboard (public) |
+| `GET` | `/health` | Minimal JSON for monitoring (public) |
 
 The token is a path segment and is checked **before** rate limiting, DNS parsing, ECS injection, or any upstream request. There is no `/dns-query` alias; the suffix is controlled by `DOH_SUFFIX` and defaults to `weduolijia`.
 
 The server listens on `0.0.0.0:5000` (`PORT` overrides), which is what Infrlo expects.
+
+## Web UI
+
+Open `https://<your-app-domain>/` to see the dashboard:
+
+- Version, uptime, Node runtime, memory
+- DoH request count, success rate, auth failures, rate-limit hits
+- Fixed ECS and rate limit
+- Per-upstream attempts, wins, errors, last RTT and last rcode
+
+It refreshes every 5 seconds and is served by the same process. The dashboard and `/api/status` are public, but neither contains `DOH_TOKEN`; the endpoint is shown as `/<token>/weduolijia`.
 
 ## Deploy on Infrlo
 
@@ -29,7 +42,7 @@ In the Infrlo dashboard, **Deploy → From Public URL** and use:
 
 Set `DOH_TOKEN` to your secret in the environment variables section. **The relay refuses to start without it** — this is deliberate, so it cannot accidentally run as an open resolver.
 
-Then open `https://<your-app-domain>/health`; it should return JSON with `"version":"1.4.0"`.
+Then open `https://<your-app-domain>/health`; it should return JSON with `"version":"1.5.0"`.
 
 The `Dockerfile` is included for platforms that build images directly. It pins Node 20 and runs as the non-root `node` user.
 

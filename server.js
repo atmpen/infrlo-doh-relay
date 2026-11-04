@@ -1,15 +1,17 @@
 'use strict';
 
-// Infrlo DoH relay — v1.4.0
+// Infrlo DoH relay — v1.5.0
 // RFC 8484 DNS-over-HTTPS relay. Infrlo expects the app on 0.0.0.0:5000.
 // Dependency-free on purpose: the platform only needs `node server.js`.
 
 const http = require('node:http');
 const http2 = require('node:http2');
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 const { buildEcsData, injectEcs } = require('./lib/ecs');
 
-const VERSION = '1.4.0';
+const VERSION = '1.5.0';
 const PORT = process.env.PORT === undefined || process.env.PORT === ''
   ? 5000
   : Number(process.env.PORT);
@@ -45,6 +47,66 @@ if (ECS_CIDR && !/^(off|none|0)$/i.test(ECS_CIDR)) {
   } catch (err) {
     console.error(`invalid DOH_ECS (${ECS_CIDR}): ${err.message}; ECS disabled`);
   }
+}
+
+const STARTED_AT = Date.now();
+const stats = {
+  dohRequests: 0,
+  dohOk: 0,
+  dohErrors: 0,
+  authFailures: 0,
+  rateLimited: 0,
+  lastRequestAt: null,
+};
+const upstreamStats = new Map();
+for (const upstream of new Set(UPSTREAMS)) {
+  let host = upstream;
+  try {
+    host = new URL(upstream).host;
+  } catch {}
+  upstreamStats.set(upstream, {
+    host,
+    attempts: 0,
+    wins: 0,
+    errors: 0,
+    lastStatus: null,
+    lastRttMs: null,
+    lastRcode: null,
+    lastError: null,
+    lastAt: null,
+  });
+}
+
+const STATUS_HTML = (() => {
+  try {
+    return fs.readFileSync(path.join(__dirname, 'public', 'index.html'));
+  } catch (err) {
+    console.error(`status page load failed: ${err.message}`);
+    return Buffer.from(
+      '<!doctype html><meta charset="utf-8"><title>Infrlo DoH Relay</title><h1>Infrlo DoH Relay</h1><p>Status page is missing.</p>',
+    );
+  }
+})();
+
+function statusPayload() {
+  const memory = process.memoryUsage();
+  return {
+    status: 'ok',
+    version: VERSION,
+    uptime: Math.round(process.uptime()),
+    startedAt: new Date(STARTED_AT).toISOString(),
+    node: process.version,
+    platform: process.platform,
+    memory: { rss: memory.rss, heapUsed: memory.heapUsed },
+    ecs: ECS_DATA ? ECS_CIDR : 'off',
+    suffix: DOH_SUFFIX,
+    auth: true,
+    rateLimitPerMin: RATE_LIMIT_PER_MIN,
+    upstreamTimeoutMs: UPSTREAM_TIMEOUT_MS,
+    dohPath: `/<token>/${DOH_SUFFIX}`,
+    stats: { ...stats },
+    upstreams: [...upstreamStats.values()],
+  };
 }
 
 const rateBuckets = new Map();
@@ -222,13 +284,34 @@ function relay(method, queryString, body, queryId, cb) {
         handle.cancel();
       } catch {}
     }
+    const stat = upstream ? upstreamStats.get(upstream) : null;
+    if (stat) stat.wins += 1;
     cb(err, data, upstream);
   };
 
-  const onResult = (upstream, err, status, data) => {
+  const onResult = (upstream, started, err, status, data) => {
     if (finished) return;
     pending -= 1;
-    if (!err && status >= 200 && status < 300 && isValidAnswer(data, queryId)) {
+    const valid = !err && status >= 200 && status < 300 && isValidAnswer(data, queryId);
+    const stat = upstreamStats.get(upstream);
+    if (stat) {
+      stat.lastStatus = status ?? null;
+      stat.lastRttMs = Date.now() - started;
+      stat.lastAt = new Date().toISOString();
+      if (err) {
+        stat.errors += 1;
+        stat.lastError = err.message || String(err);
+      } else if (!(status >= 200 && status < 300)) {
+        stat.errors += 1;
+        stat.lastError = `HTTP ${status}`;
+      } else if (valid) {
+        stat.lastRcode = data[3] & 0x0f;
+        stat.lastError = null;
+      } else {
+        stat.lastError = 'invalid DNS answer';
+      }
+    }
+    if (valid) {
       const rcode = data[3] & 0x0f;
       // NOERROR and NXDOMAIN are useful answers; error rcodes are kept only
       // as a fallback when every upstream fails to produce a useful one.
@@ -246,14 +329,17 @@ function relay(method, queryString, body, queryId, cb) {
 
   for (const upstream of upstreams) {
     if (finished) break;
+    const stat = upstreamStats.get(upstream);
+    if (stat) stat.attempts += 1;
+    const started = Date.now();
     try {
       const url = new URL(upstream);
       const handle = relayOnce(url, method, queryString, body, (err, status, data) => {
-        onResult(upstream, err, status, data);
+        onResult(upstream, started, err, status, data);
       });
       if (handle) handles.push(handle);
     } catch (err) {
-      onResult(upstream, err, null, null);
+      onResult(upstream, started, err, null, null);
     }
   }
 }
@@ -326,7 +412,11 @@ function handle(req, res) {
   // The token is a path segment; never write it to logs.
   const displayPath = `/[redacted]/${DOH_SUFFIX}`;
 
-  if (url.pathname === '/' || url.pathname === '/health') {
+  if (url.pathname === '/') {
+    return send(res, 200, STATUS_HTML, 'text/html; charset=utf-8');
+  }
+
+  if (url.pathname === '/health') {
     return send(
       res,
       200,
@@ -343,22 +433,34 @@ function handle(req, res) {
     );
   }
 
+  if (url.pathname === '/api/status') {
+    return send(res, 200, JSON.stringify(statusPayload()), 'application/json; charset=utf-8');
+  }
+
   const segments = url.pathname.split('/').filter(Boolean);
   if (segments.length !== 2 || segments[1] !== DOH_SUFFIX) {
     return send(res, 404, 'not found\n');
   }
 
+  stats.dohRequests += 1;
+  stats.lastRequestAt = new Date().toISOString();
+
   let token;
   try {
     token = decodeURIComponent(segments[0]);
   } catch {
+    stats.authFailures += 1;
     return send(res, 400, 'bad token encoding\n');
   }
 
   // Auth first: no rate-limit bucket, DNS parsing or upstream work before this.
-  if (!tokenMatches(token)) return send(res, 401, 'unauthorized\n');
+  if (!tokenMatches(token)) {
+    stats.authFailures += 1;
+    return send(res, 401, 'unauthorized\n');
+  }
 
   if (rateLimited(clientIp(req))) {
+    stats.rateLimited += 1;
     return send(res, 429, 'rate limited\n', 'text/plain; charset=utf-8', { 'retry-after': '60' });
   }
 
@@ -368,9 +470,11 @@ function handle(req, res) {
 
   const reply = (err, data, upstream) => {
     if (err) {
+      stats.dohErrors += 1;
       log(502, ` (${err.message})`);
       return send(res, 502, 'upstream error\n');
     }
+    stats.dohOk += 1;
     log(200, upstream ? ` via ${new URL(upstream).hostname}` : '');
     send(res, 200, data, 'application/dns-message');
   };

@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Infrlo DoH Relay — Status</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f6fb;
+    --bg-2: #eef0f8;
+    --panel: rgba(255,255,255,.86);
+    --panel-solid: #ffffff;
+    --text: #111827;
+    --muted: #667085;
+    --line: #e4e7ec;
+    --accent: #7c3aed;
+    --green: #059669;
+    --green-bg: #ecfdf5;
+    --red: #dc2626;
+    --red-bg: #fef2f2;
+    --amber: #b45309;
+    --shadow: 0 18px 50px rgba(17,24,39,.08);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b0f17;
+      --bg-2: #0f1522;
+      --panel: rgba(17,24,39,.72);
+      --panel-solid: #111827;
+      --text: #f3f4f6;
+      --muted: #98a2b3;
+      --line: #1f2937;
+      --accent: #a78bfa;
+      --green: #34d399;
+      --green-bg: rgba(16,185,129,.12);
+      --red: #f87171;
+      --red-bg: rgba(239,68,68,.12);
+      --amber: #fbbf24;
+      --shadow: 0 18px 50px rgba(0,0,0,.35);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    color: var(--text);
+    background:
+      radial-gradient(circle at 12% 0%, rgba(124,58,237,.13), transparent 34rem),
+      radial-gradient(circle at 88% 8%, rgba(59,130,246,.10), transparent 30rem),
+      linear-gradient(180deg, var(--bg), var(--bg-2));
+  }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 40px 20px 56px; }
+  .hero { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 26px; }
+  .brand { display: flex; align-items: center; gap: 14px; }
+  .mark {
+    width: 44px; height: 44px; border-radius: 13px;
+    background: linear-gradient(145deg, var(--accent), #3b82f6);
+    color: #fff; display: grid; place-items: center;
+    font-weight: 800; font-size: 20px; letter-spacing: -1px;
+    box-shadow: 0 10px 24px rgba(124,58,237,.28);
+  }
+  h1 { font-size: 21px; line-height: 1.15; margin: 0; letter-spacing: -.3px; }
+  .sub { margin: 3px 0 0; color: var(--muted); font-size: 12.5px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 9px 13px; border-radius: 999px;
+    background: var(--panel); border: 1px solid var(--line);
+    font-size: 12.5px; font-weight: 650; color: var(--muted);
+    box-shadow: var(--shadow); white-space: nowrap;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 0 4px rgba(180,83,9,.12); }
+  .pill.ok { color: var(--green); background: var(--green-bg); border-color: color-mix(in srgb, var(--green) 28%, transparent); }
+  .pill.ok .dot { background: var(--green); box-shadow: 0 0 0 4px rgba(5,150,105,.14); animation: pulse 2s infinite; }
+  .pill.bad { color: var(--red); background: var(--red-bg); border-color: color-mix(in srgb, var(--red) 28%, transparent); }
+  .pill.bad .dot { background: var(--red); box-shadow: none; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+    padding: 16px 16px 15px; box-shadow: var(--shadow);
+    backdrop-filter: blur(10px);
+  }
+  .card .k { color: var(--muted); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
+  .card .v { margin-top: 8px; font-size: 20px; font-weight: 750; letter-spacing: -.4px; font-variant-numeric: tabular-nums; }
+  .card .v.small { font-size: 15px; word-break: break-word; }
+  .card .hint { margin-top: 5px; color: var(--muted); font-size: 11.5px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 18px;
+    box-shadow: var(--shadow); backdrop-filter: blur(10px);
+    margin-bottom: 16px; overflow: hidden;
+  }
+  .panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 18px 20px 14px; border-bottom: 1px solid var(--line); }
+  h2 { margin: 0; font-size: 15px; letter-spacing: -.2px; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); padding: 11px 20px; background: color-mix(in srgb, var(--panel-solid) 70%, transparent); }
+  td { padding: 13px 20px; border-top: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  tbody tr:hover { background: color-mix(in srgb, var(--accent) 4%, transparent); }
+  .host { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; font-weight: 650; }
+  .bad { color: var(--red); }
+  .good { color: var(--green); }
+  .endpoint { padding: 18px 20px 20px; display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .endpoint code {
+    display: inline-block; padding: 10px 13px; border-radius: 10px;
+    background: color-mix(in srgb, var(--accent) 8%, var(--panel-solid));
+    border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--line));
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px; color: var(--text); word-break: break-all;
+  }
+  .foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 4px 2px; color: var(--muted); font-size: 12px; }
+  button {
+    font: inherit; font-size: 12px; font-weight: 650; color: var(--text);
+    background: var(--panel-solid); border: 1px solid var(--line); border-radius: 9px;
+    padding: 8px 12px; cursor: pointer; transition: border-color .15s, transform .15s;
+  }
+  button:hover { border-color: var(--accent); transform: translateY(-1px); }
+  .empty { padding: 28px 20px; text-align: center; color: var(--muted); font-size: 12.5px; }
+  @media (max-width: 640px) {
+    .wrap { padding: 24px 14px 40px; }
+    .hero { align-items: flex-start; flex-direction: column; }
+    .card .v { font-size: 18px; }
+    th, td { padding-left: 14px; padding-right: 14px; }
+  }
+</style>
+</head>
+<body>
+<main class="wrap">
+  <header class="hero">
+    <div class="brand">
+      <div class="mark">D</div>
+      <div>
+        <h1>Infrlo DoH Relay</h1>
+        <p class="sub">DNS-over-HTTPS status</p>
+      </div>
+    </div>
+    <div class="pill" id="pill" role="status" aria-live="polite">
+      <span class="dot"></span><span id="pill-text">Connecting…</span>
+    </div>
+  </header>
+
+  <section class="grid">
+    <div class="card"><div class="k">Version</div><div class="v" id="version">—</div><div class="hint" id="node">—</div></div>
+    <div class="card"><div class="k">Uptime</div><div class="v" id="uptime">—</div><div class="hint" id="started">—</div></div>
+    <div class="card"><div class="k">DoH requests</div><div class="v" id="requests">—</div><div class="hint" id="last-request">—</div></div>
+    <div class="card"><div class="k">Success rate</div><div class="v" id="success">—</div><div class="hint" id="errors">—</div></div>
+    <div class="card"><div class="k">ECS</div><div class="v small" id="ecs">—</div><div class="hint">Fixed client subnet</div></div>
+    <div class="card"><div class="k">Upstreams</div><div class="v" id="upstream-count">—</div><div class="hint">Raced in parallel</div></div>
+    <div class="card"><div class="k">Rate limit</div><div class="v small" id="rate-limit">—</div><div class="hint">Per client IP</div></div>
+    <div class="card"><div class="k">Memory</div><div class="v small" id="memory">—</div><div class="hint" id="platform">—</div></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Upstreams</h2>
+      <span class="muted" id="updated">—</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Host</th><th>Attempts</th><th>Wins</th><th>Errors</th><th>Last RTT</th><th>Last result</th></tr>
+        </thead>
+        <tbody id="upstreams">
+          <tr><td colspan="6" class="empty">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>DoH endpoint</h2>
+      <span class="muted">token required</span>
+    </div>
+    <div class="endpoint">
+      <code id="doh-path">/&lt;token&gt;/weduolijia</code>
+      <span class="muted">The token is never shown on this page.</span>
+    </div>
+  </section>
+
+  <footer class="foot">
+    <span>Auto-refresh every 5s</span>
+    <button id="refresh" type="button">Refresh now</button>
+  </footer>
+</main>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const fmtUptime = (sec) => {
+    sec = Math.max(0, Math.floor(sec));
+    const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    if (d) return `${d}d ${h}h`;
+    if (h) return `${h}h ${m}m`;
+    if (m) return `${m}m ${s}s`;
+    return `${s}s`;
+  };
+  const fmtBytes = (b) => {
+    if (b == null) return '—';
+    if (b < 1024 * 1024) return `${(b / 1024).toFixed(0)} KB`;
+    return `${(b / 1024 / 1024).toFixed(1)} MB`;
+  };
+  const fmtRtt = (ms) => (ms == null ? '—' : `${ms} ms`);
+  const fmtTime = (iso) => {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString();
+  };
+  const setPill = (ok, text) => {
+    const pill = $('pill');
+    pill.classList.toggle('ok', ok);
+    pill.classList.toggle('bad', ok === false);
+    $('pill-text').textContent = text;
+  };
+  const lastResult = (u) => {
+    if (u.lastError) return `<span class="bad">${esc(u.lastError)}</span>`;
+    if (u.lastStatus == null) return '—';
+    const rcode = u.lastRcode == null ? '' : ` · rcode ${esc(u.lastRcode)}`;
+    const cls = u.lastRcode === 0 || u.lastRcode === 3 ? 'good' : 'bad';
+    return `<span class="${cls}">HTTP ${esc(u.lastStatus)}${rcode}</span>`;
+  };
+  const render = (data) => {
+    $('version').textContent = data.version;
+    $('node').textContent = `Node ${data.node}`;
+    $('uptime').textContent = fmtUptime(data.uptime);
+    $('started').textContent = `since ${fmtTime(data.startedAt)}`;
+    $('requests').textContent = data.stats.dohRequests;
+    $('last-request').textContent = data.stats.lastRequestAt ? `last ${fmtTime(data.stats.lastRequestAt)}` : 'no queries yet';
+    const rate = data.stats.dohRequests ? Math.round((data.stats.dohOk / data.stats.dohRequests) * 100) : null;
+    $('success').textContent = rate == null ? '—' : `${rate}%`;
+    $('errors').textContent = `${data.stats.dohErrors} upstream errors · ${data.stats.authFailures} auth failures`;
+    $('ecs').textContent = data.ecs;
+    $('upstream-count').textContent = data.upstreams.length;
+    $('rate-limit').textContent = data.rateLimitPerMin ? `${data.rateLimitPerMin}/min` : 'off';
+    $('memory').textContent = `${fmtBytes(data.memory.rss)} RSS`;
+    $('platform').textContent = data.platform;
+    $('doh-path').textContent = data.dohPath;
+    $('updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
+    const rows = data.upstreams.map((u) => `
+      <tr>
+        <td><span class="host">${esc(u.host)}</span></td>
+        <td>${esc(u.attempts)}</td>
+        <td>${esc(u.wins)}</td>
+        <td class="${u.errors ? 'bad' : ''}">${esc(u.errors)}</td>
+        <td>${esc(fmtRtt(u.lastRttMs))}</td>
+        <td>${lastResult(u)}</td>
+      </tr>`).join('');
+    $('upstreams').innerHTML = rows || '<tr><td colspan="6" class="empty">No upstreams configured.</td></tr>';
+  };
+  const load = async () => {
+    try {
+      const res = await fetch('/api/status', { cache: 'no-store' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      render(data);
+      setPill(true, 'Running');
+    } catch (err) {
+      setPill(false, `Status unavailable: ${err.message}`);
+    }
+  };
+  $('refresh').addEventListener('click', load);
+  load();
+  setInterval(load, 5000);
+})();
+</script>
+</body>
+</html>

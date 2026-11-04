@@ -272,10 +272,46 @@ test('health endpoint reports the version', async () => {
     assert.equal(response.status, 200);
     const body = await response.json();
     assert.equal(body.status, 'ok');
-    assert.equal(body.version, '1.4.0');
+    assert.equal(body.version, '1.5.0');
     assert.equal(body.ecs, '111.8.1.0/24');
     assert.equal(body.auth, true);
     assert.equal(body.suffix, TEST_SUFFIX);
+  } finally {
+    await stopRelay(relay.child);
+  }
+});
+
+test('serves the status page at /', async () => {
+  const relay = await startRelay({ DOH_UPSTREAMS: mockUpstream });
+  try {
+    const response = await fetch(relay.base + '/');
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get('content-type'), /text\/html/);
+    const html = await response.text();
+    assert.match(html, /Infrlo DoH Relay/);
+    assert.match(html, /\/api\/status/);
+    assert.equal(html.includes(TEST_TOKEN), false);
+  } finally {
+    await stopRelay(relay.child);
+  }
+});
+
+test('serves status JSON without the token', async () => {
+  const relay = await startRelay({ DOH_UPSTREAMS: mockUpstream });
+  try {
+    const query = buildQuery('example.com');
+    assert.equal((await dohPost(relay.base, query)).status, 200);
+    const response = await fetch(relay.base + '/api/status');
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.version, '1.5.0');
+    assert.equal(body.auth, true);
+    assert.equal(body.suffix, TEST_SUFFIX);
+    assert.equal(body.stats.dohRequests, 1);
+    assert.equal(body.stats.dohOk, 1);
+    assert.equal(body.upstreams.length, 1);
+    assert.ok(body.upstreams[0].wins >= 1);
+    assert.equal(JSON.stringify(body).includes(TEST_TOKEN), false);
   } finally {
     await stopRelay(relay.child);
   }
