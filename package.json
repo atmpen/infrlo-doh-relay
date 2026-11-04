@@ -1,6 +1,6 @@
 {
   "name": "infrlo-doh-relay",
-  "version": "1.3.2",
+  "version": "1.4.0",
   "private": true,
   "description": "Dependency-free RFC 8484 DNS-over-HTTPS relay for Infrlo",
   "main": "server.js",

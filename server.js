@@ -1,6 +1,6 @@
 'use strict';
 
-// Infrlo DoH relay — v1.3.2
+// Infrlo DoH relay — v1.4.0
 // RFC 8484 DNS-over-HTTPS relay. Infrlo expects the app on 0.0.0.0:5000.
 // Dependency-free on purpose: the platform only needs `node server.js`.
 
@@ -9,7 +9,7 @@ const http2 = require('node:http2');
 const crypto = require('node:crypto');
 const { buildEcsData, injectEcs } = require('./lib/ecs');
 
-const VERSION = '1.3.2';
+const VERSION = '1.4.0';
 const PORT = process.env.PORT === undefined || process.env.PORT === ''
   ? 5000
   : Number(process.env.PORT);
@@ -47,14 +47,8 @@ if (ECS_CIDR && !/^(off|none|0)$/i.test(ECS_CIDR)) {
   }
 }
 
-let preferredUpstream = 0;
 const rateBuckets = new Map();
 const sessions = new Map();
-
-function orderedUpstreams() {
-  const first = UPSTREAMS[preferredUpstream] || UPSTREAMS[0];
-  return [first, ...UPSTREAMS.filter((url) => url !== first)];
-}
 
 function isValidAnswer(data, queryId) {
   return (
@@ -130,6 +124,13 @@ function relayOnceH1(url, method, queryString, body, cb) {
   req.on('error', (err) => finish(err));
   if (body) req.write(body);
   req.end();
+  return {
+    cancel() {
+      try {
+        req.destroy();
+      } catch {}
+    },
+  };
 }
 
 function relayOnceH2(url, method, queryString, body, cb) {
@@ -190,6 +191,13 @@ function relayOnceH2(url, method, queryString, body, cb) {
 
   if (body) req.write(body);
   req.end();
+  return {
+    cancel() {
+      try {
+        req.close(http2.constants.NGHTTP2_CANCEL);
+      } catch {}
+    },
+  };
 }
 
 function relayOnce(url, method, queryString, body, cb) {
@@ -198,26 +206,56 @@ function relayOnce(url, method, queryString, body, cb) {
 }
 
 function relay(method, queryString, body, queryId, cb) {
-  const upstreams = orderedUpstreams();
-  const attempt = (index) => {
-    if (index >= upstreams.length) return cb(new Error('all upstreams failed'));
-    const upstream = upstreams[index];
-    let url;
-    try {
-      url = new URL(upstream);
-    } catch {
-      return attempt(index + 1);
+  const upstreams = [...new Set(UPSTREAMS)];
+  if (upstreams.length === 0) return cb(new Error('no upstreams configured'));
+
+  const handles = [];
+  let finished = false;
+  let pending = upstreams.length;
+  let fallback = null;
+
+  const finish = (err, data, upstream) => {
+    if (finished) return;
+    finished = true;
+    for (const handle of handles) {
+      try {
+        handle.cancel();
+      } catch {}
     }
-    relayOnce(url, method, queryString, body, (err, status, data) => {
-      if (!err && status >= 200 && status < 300 && isValidAnswer(data, queryId)) {
-        const preferred = UPSTREAMS.indexOf(upstream);
-        if (preferred >= 0) preferredUpstream = preferred;
-        return cb(null, data, upstream);
-      }
-      attempt(index + 1);
-    });
+    cb(err, data, upstream);
   };
-  attempt(0);
+
+  const onResult = (upstream, err, status, data) => {
+    if (finished) return;
+    pending -= 1;
+    if (!err && status >= 200 && status < 300 && isValidAnswer(data, queryId)) {
+      const rcode = data[3] & 0x0f;
+      // NOERROR and NXDOMAIN are useful answers; error rcodes are kept only
+      // as a fallback when every upstream fails to produce a useful one.
+      if (rcode === 0 || rcode === 3) {
+        finish(null, data, upstream);
+        return;
+      }
+      if (!fallback) fallback = { data, upstream };
+    }
+    if (pending === 0) {
+      if (fallback) finish(null, fallback.data, fallback.upstream);
+      else finish(new Error('all upstreams failed'));
+    }
+  };
+
+  for (const upstream of upstreams) {
+    if (finished) break;
+    try {
+      const url = new URL(upstream);
+      const handle = relayOnce(url, method, queryString, body, (err, status, data) => {
+        onResult(upstream, err, status, data);
+      });
+      if (handle) handles.push(handle);
+    } catch (err) {
+      onResult(upstream, err, null, null);
+    }
+  }
 }
 
 function send(res, status, body, type, extraHeaders = {}) {

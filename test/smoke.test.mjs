@@ -56,7 +56,7 @@ function buildAnswer(query, ip = ANSWER_IP, idOffset = 0) {
   return Buffer.concat([header, question, answer]);
 }
 
-function startMock({ idOffset = 0 } = {}) {
+function startMock({ idOffset = 0, ip = ANSWER_IP, delayMs = 0 } = {}) {
   const requests = [];
   const server = http.createServer((req, res) => {
     const chunks = [];
@@ -75,12 +75,17 @@ function startMock({ idOffset = 0 } = {}) {
         contentType: req.headers['content-type'],
         query: Buffer.from(query),
       });
-      const answer = buildAnswer(query, ANSWER_IP, idOffset);
-      res.writeHead(200, {
-        'content-type': 'application/dns-message',
-        'content-length': answer.length,
-      });
-      res.end(answer);
+      const respond = () => {
+        if (res.writableEnded || res.destroyed) return;
+        const answer = buildAnswer(query, ip, idOffset);
+        res.writeHead(200, {
+          'content-type': 'application/dns-message',
+          'content-length': answer.length,
+        });
+        res.end(answer);
+      };
+      if (delayMs) setTimeout(respond, delayMs).unref();
+      else respond();
     });
   });
   return new Promise((resolve) => {
@@ -267,7 +272,7 @@ test('health endpoint reports the version', async () => {
     assert.equal(response.status, 200);
     const body = await response.json();
     assert.equal(body.status, 'ok');
-    assert.equal(body.version, '1.3.2');
+    assert.equal(body.version, '1.4.0');
     assert.equal(body.ecs, '111.8.1.0/24');
     assert.equal(body.auth, true);
     assert.equal(body.suffix, TEST_SUFFIX);
@@ -472,6 +477,31 @@ test('uses HTTP/2 for http2:// upstreams', async () => {
   } finally {
     await stopRelay(relay.child);
     h2mock.server.close();
+  }
+});
+
+test('races upstreams and returns the first useful answer', async () => {
+  const fast = await startMock({ ip: '203.0.113.7' });
+  const slow = await startMock({ ip: '203.0.113.8', delayMs: 600 });
+  const relay = await startRelay({
+    DOH_UPSTREAMS: `http://127.0.0.1:${slow.port}/dns-query,http://127.0.0.1:${fast.port}/dns-query`,
+    DOH_ECS: 'off',
+  });
+  try {
+    const query = buildQuery('example.com');
+    const started = Date.now();
+    const response = await dohPost(relay.base, query);
+    const elapsed = Date.now() - started;
+    assert.equal(response.status, 200);
+    const buffer = Buffer.from(await response.arrayBuffer());
+    assert.equal(buffer.subarray(-4).join('.'), '203.0.113.7');
+    assert.ok(elapsed < 600, `fast upstream should win (${elapsed}ms)`);
+  } finally {
+    await stopRelay(relay.child);
+    fast.server.closeAllConnections?.();
+    slow.server.closeAllConnections?.();
+    fast.server.close();
+    slow.server.close();
   }
 });
 
