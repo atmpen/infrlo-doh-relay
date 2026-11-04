@@ -1,6 +1,6 @@
 'use strict';
 
-// Infrlo DoH relay — v1.6.0
+// Infrlo DoH relay — v1.7.0
 // RFC 8484 DNS-over-HTTPS relay. Infrlo expects the app on 0.0.0.0:5000.
 // Dependency-free on purpose: the platform only needs `node server.js`.
 
@@ -11,7 +11,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { buildEcsData, injectEcs } = require('./lib/ecs');
 
-const VERSION = '1.6.0';
+const VERSION = '1.7.0';
 const PORT = process.env.PORT === undefined || process.env.PORT === ''
   ? 5000
   : Number(process.env.PORT);
@@ -41,14 +41,64 @@ const RATE_LIMIT_PER_MIN = process.env.RATE_LIMIT_PER_MIN === undefined
   : Math.max(0, Number(process.env.RATE_LIMIT_PER_MIN) || 0);
 const UPSTREAM_TIMEOUT_MS = Math.max(500, Number(process.env.UPSTREAM_TIMEOUT_MS) || 3000);
 const MAX_BODY = 65535;
-// Default ECS is a Hunan Mobile /24 (AS56047, Changsha). DOH_ECS=off disables it.
-const ECS_CIDR = process.env.DOH_ECS === undefined ? '111.8.1.0/24' : process.env.DOH_ECS.trim();
+// DOH_ECS is the initial default; the dashboard can override it at runtime.
+// The override is stored in ECS_FILE and takes precedence on restart.
+const ENV_ECS = process.env.DOH_ECS === undefined ? '111.8.1.0/24' : process.env.DOH_ECS.trim();
+const ECS_FILE = process.env.ECS_FILE === undefined
+  ? path.join(__dirname, 'data', 'ecs.txt')
+  : process.env.ECS_FILE.trim();
+let ECS_CIDR = 'off';
 let ECS_DATA = null;
-if (ECS_CIDR && !/^(off|none|0)$/i.test(ECS_CIDR)) {
+
+function applyEcsConfig(value) {
+  if (!value || /^(off|none|0)$/i.test(value)) {
+    ECS_CIDR = 'off';
+    ECS_DATA = null;
+    return;
+  }
+  const data = buildEcsData(value);
+  ECS_CIDR = value;
+  ECS_DATA = data;
+}
+
+function readEcsOverride() {
+  if (!ECS_FILE) return null;
   try {
-    ECS_DATA = buildEcsData(ECS_CIDR);
+    return fs.readFileSync(ECS_FILE, 'utf8').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function writeEcsOverride(value) {
+  if (!ECS_FILE) return false;
+  try {
+    fs.mkdirSync(path.dirname(ECS_FILE), { recursive: true });
+    fs.writeFileSync(ECS_FILE, value + '\n');
+    return true;
   } catch (err) {
-    console.error(`invalid DOH_ECS (${ECS_CIDR}): ${err.message}; ECS disabled`);
+    console.error(`ecs override write failed: ${err.message}`);
+    return false;
+  }
+}
+
+const fileEcs = readEcsOverride();
+let initialEcsApplied = false;
+if (fileEcs) {
+  try {
+    applyEcsConfig(fileEcs);
+    initialEcsApplied = true;
+  } catch (err) {
+    console.error(`invalid ECS override (${fileEcs}): ${err.message}`);
+  }
+}
+if (!initialEcsApplied) {
+  try {
+    applyEcsConfig(ENV_ECS);
+  } catch (err) {
+    console.error(`invalid DOH_ECS (${ENV_ECS}): ${err.message}; ECS disabled`);
+    ECS_CIDR = 'off';
+    ECS_DATA = null;
   }
 }
 
@@ -512,6 +562,25 @@ function handleReveal(req, res) {
   });
 }
 
+function handleEcsConfig(req, res) {
+  if (!sessionValid(req)) return sendJson(res, 401, { error: 'locked' });
+  readJson(req, (err, body) => {
+    if (err) return sendJson(res, 400, { error: 'bad_request' });
+    const value = String((body && body.ecs) || '').trim();
+    if (!value) return sendJson(res, 400, { error: 'invalid_ecs', message: '请输入 IPv4 CIDR 或 off' });
+    try {
+      applyEcsConfig(value);
+    } catch (e) {
+      return sendJson(res, 400, {
+        error: 'invalid_ecs',
+        message: 'ECS 网段格式错误，请使用 IPv4 CIDR（例如 111.8.1.0/24）或 off。',
+      });
+    }
+    const persisted = writeEcsOverride(ECS_CIDR);
+    sendJson(res, 200, { ok: true, ecs: ECS_CIDR, persisted });
+  });
+}
+
 function handleLock(req, res) {
   const id = readCookie(req, 'idr_session');
   if (id) webSessions.delete(id);
@@ -567,6 +636,9 @@ function handle(req, res) {
   }
   if (url.pathname === '/api/lock' && req.method === 'POST') {
     return handleLock(req, res);
+  }
+  if (url.pathname === '/api/config/ecs' && req.method === 'POST') {
+    return handleEcsConfig(req, res);
   }
 
   const segments = url.pathname.split('/').filter(Boolean);

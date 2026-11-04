@@ -149,6 +149,8 @@
   button:hover { border-color: var(--accent); transform: translateY(-1px); }
   button:disabled { opacity: .55; cursor: wait; transform: none; }
   button.ghost { background: transparent; box-shadow: none; }
+  button.link { padding: 0; border: 0; background: transparent; color: var(--accent); font-size: 11.5px; font-weight: 650; cursor: pointer; text-decoration: underline; }
+  button.link:hover { transform: none; border: 0; }
   .login-wrap { display: grid; place-items: center; padding: 10vh 0 12vh; }
   .login-card {
     width: min(400px, 100%);
@@ -228,7 +230,7 @@
       <div class="card"><div class="k">运行时长</div><div class="v" id="uptime">—</div><div class="hint" id="started">—</div></div>
       <div class="card"><div class="k">DoH 请求</div><div class="v" id="requests">—</div><div class="hint" id="last-request">—</div></div>
       <div class="card"><div class="k">成功率</div><div class="v" id="success">—</div><div class="hint" id="errors">—</div></div>
-      <div class="card"><div class="k">ECS</div><div class="v small" id="ecs">—</div><div class="hint">固定客户端网段</div></div>
+      <div class="card"><div class="k">ECS</div><div class="v small" id="ecs">—</div><div class="hint">固定客户端网段 · <button id="ecs-edit" type="button" class="link">编辑</button></div></div>
       <div class="card"><div class="k">上游</div><div class="v" id="upstream-count">—</div><div class="hint">并行竞速</div></div>
       <div class="card"><div class="k">限流</div><div class="v small" id="rate-limit">—</div><div class="hint">按客户端 IP</div></div>
       <div class="card"><div class="k">内存</div><div class="v small" id="memory">—</div><div class="hint" id="platform">—</div></div>
@@ -283,6 +285,22 @@
     </form>
     <p class="error" id="copy-error" hidden></p>
     <p class="success" id="copy-success" hidden></p>
+  </div>
+</div>
+
+<div class="modal" id="ecs-modal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="ecs-title">
+    <h3 id="ecs-title">自定义 ECS 网段</h3>
+    <p class="muted">支持 IPv4 CIDR，例如 111.8.1.0/24；填 off 可关闭 ECS。</p>
+    <form id="ecs-form">
+      <input id="ecs-input" placeholder="111.8.1.0/24 或 off" required>
+      <div class="modal-actions">
+        <button type="button" id="ecs-cancel">取消</button>
+        <button type="submit" id="ecs-submit">保存</button>
+      </div>
+    </form>
+    <p class="error" id="ecs-error" hidden></p>
+    <p class="success" id="ecs-success" hidden></p>
   </div>
 </div>
 
@@ -459,6 +477,59 @@
     setTimeout(() => $('token-input').focus(), 50);
   };
 
+  const closeEcsModal = () => {
+    $('ecs-modal').hidden = true;
+    $('ecs-error').hidden = true;
+    $('ecs-success').hidden = true;
+    $('ecs-submit').disabled = false;
+  };
+
+  const openEcsModal = () => {
+    $('ecs-modal').hidden = false;
+    $('ecs-input').value = (statusData && statusData.ecs) || 'off';
+    $('ecs-error').hidden = true;
+    $('ecs-success').hidden = true;
+    setTimeout(() => $('ecs-input').focus(), 50);
+  };
+
+  const saveEcs = async (event) => {
+    event.preventDefault();
+    $('ecs-error').hidden = true;
+    $('ecs-success').hidden = true;
+    $('ecs-submit').disabled = true;
+    try {
+      const res = await fetch('/api/config/ecs', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ecs: $('ecs-input').value }),
+      });
+      if (res.status === 401) {
+        showLogin();
+        closeEcsModal();
+        return;
+      }
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        $('ecs-error').textContent = data.message || '保存失败，请检查 CIDR 格式。';
+        $('ecs-error').hidden = false;
+        return;
+      }
+      const data = await res.json();
+      $('ecs-success').textContent = data.persisted
+        ? '已保存并生效。'
+        : '已生效；当前环境未持久化，重启后可能恢复默认。';
+      $('ecs-success').hidden = false;
+      await load();
+      setTimeout(closeEcsModal, 1200);
+    } catch (err) {
+      $('ecs-error').textContent = `保存失败：${err.message}`;
+      $('ecs-error').hidden = false;
+    } finally {
+      $('ecs-submit').disabled = false;
+    }
+  };
+
   const reveal = async (event) => {
     event.preventDefault();
     $('copy-error').hidden = true;
@@ -522,8 +593,13 @@
   $('copy-open').addEventListener('click', openCopyModal);
   $('copy-cancel').addEventListener('click', closeCopyModal);
   $('copy-form').addEventListener('submit', reveal);
+  $('ecs-edit').addEventListener('click', openEcsModal);
+  $('ecs-cancel').addEventListener('click', closeEcsModal);
+  $('ecs-form').addEventListener('submit', saveEcs);
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !$('copy-modal').hidden) closeCopyModal();
+    if (e.key !== 'Escape') return;
+    if (!$('copy-modal').hidden) closeCopyModal();
+    if (!$('ecs-modal').hidden) closeEcsModal();
   });
 
   updateThemeButton();

@@ -1,6 +1,6 @@
 # infrlo-doh-relay
 
-v1.6.0 — a dependency-free [RFC 8484](https://www.rfc-editor.org/rfc/rfc8484) DNS-over-HTTPS relay, made for [Infrlo](https://infrlo.com/).
+v1.7.0 — a dependency-free [RFC 8484](https://www.rfc-editor.org/rfc/rfc8484) DNS-over-HTTPS relay, made for [Infrlo](https://infrlo.com/).
 
 It accepts DoH queries on `/<DOH_TOKEN>/weduolijia`, injects a fixed EDNS Client Subnet (ECS) into every upstream query, forwards the DNS wire message over HTTP/2, and returns the answer unchanged. The root URL serves a live status dashboard. No cache, no query logging, no npm dependencies.
 
@@ -14,6 +14,7 @@ It accepts DoH queries on `/<DOH_TOKEN>/weduolijia`, injects a fixed EDNS Client
 | `POST` | `/api/unlock` | Exchange the homepage password for a session cookie |
 | `GET` | `/api/status` | Dashboard JSON (session cookie required) |
 | `POST` | `/api/reveal` | Validate the DoH token (session cookie required) |
+| `POST` | `/api/config/ecs` | Change the fixed ECS subnet (session cookie required) |
 | `POST` | `/api/lock` | Clear the session |
 | `GET` | `/health` | Minimal JSON for monitoring (public) |
 
@@ -29,9 +30,10 @@ Open `https://<your-app-domain>/`. The page is in Chinese and starts with a pass
 - The dashboard shows version, uptime, Node runtime, memory, DoH request/success counters, ECS, rate limit, and per-upstream attempts/wins/errors/last RTT/last rcode.
 - The DNS endpoint is displayed with the token masked: `https://<app-domain>/••••••••/weduolijia`.
 - Clicking 复制 opens a DoH token prompt. The server validates the token; on success the browser copies the full URL to the clipboard, on failure it shows a warning.
+- The ECS card has an 编辑 button. Enter an IPv4 CIDR (for example `111.8.1.0/24`) or `off`; the change applies to subsequent queries immediately. It is written to `ECS_FILE` and takes precedence over `DOH_ECS` on restart when the file is writable.
 - A dark/light theme toggle is persisted in `localStorage`; 锁定 clears the session.
 
-`/api/status` and `/api/reveal` require the session cookie; `/api/reveal` additionally requires the correct DoH token. `/health` stays public for monitoring and contains no secrets.
+`/api/status`, `/api/reveal`, and `/api/config/ecs` require the session cookie; `/api/reveal` additionally requires the correct DoH token. `/health` stays public for monitoring and contains no secrets.
 
 ## Deploy on Infrlo
 
@@ -46,7 +48,7 @@ In the Infrlo dashboard, **Deploy → From Public URL** and use:
 
 Set `DOH_TOKEN` to your secret in the environment variables section. **The relay refuses to start without it** — this is deliberate, so it cannot accidentally run as an open resolver. Optionally set `WEB_PASSWORD` to use a different password for the dashboard; if omitted, the homepage password is the DoH token.
 
-Then open `https://<your-app-domain>/health`; it should return JSON with `"version":"1.6.0"`.
+Then open `https://<your-app-domain>/health`; it should return JSON with `"version":"1.7.0"`.
 
 The `Dockerfile` is included for platforms that build images directly. It pins Node 20 and runs as the non-root `node` user.
 
@@ -66,7 +68,8 @@ The `Dockerfile` is included for platforms that build images directly. It pins N
 | `DOH_TOKEN` | **required** | Secret path segment. The DoH URL is `/<DOH_TOKEN>/<DOH_SUFFIX>`. Never commit it to the repo. |
 | `WEB_PASSWORD` | `DOH_TOKEN` | Homepage password. Set a separate value if the dashboard password should differ from the DoH token. |
 | `DOH_SUFFIX` | `weduolijia` | Last path segment; must be a single path segment. |
-| `DOH_ECS` | `111.8.1.0/24` | Fixed IPv4 ECS injected into every upstream query (Hunan Mobile, Changsha). `off` disables injection and passes the client's own ECS through. |
+| `DOH_ECS` | `111.8.1.0/24` | Initial IPv4 ECS injected into every upstream query (Hunan Mobile, Changsha). `off` disables injection and passes the client's own ECS through. The dashboard can override it at runtime. |
+| `ECS_FILE` | `data/ecs.txt` | File written by the dashboard's ECS editor. When present and readable, it takes precedence over `DOH_ECS` on restart. Set it to an empty string to disable persistence. |
 | `DOH_UPSTREAMS` | Quad9 dns11, Google | Comma-separated DoH URLs; all queried in parallel. |
 | `RATE_LIMIT_PER_MIN` | `600` | Per-IP requests per minute. `0` disables the limiter. |
 | `UPSTREAM_TIMEOUT_MS` | `3000` | Per-upstream timeout before trying the next one. |

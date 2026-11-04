@@ -204,7 +204,7 @@ async function closedPort() {
 
 async function startRelay(env = {}) {
   const child = spawn(process.execPath, [serverPath], {
-    env: { ...process.env, PORT: '0', DOH_TOKEN: TEST_TOKEN, DOH_SUFFIX: TEST_SUFFIX, ...env },
+    env: { ...process.env, PORT: '0', DOH_TOKEN: TEST_TOKEN, DOH_SUFFIX: TEST_SUFFIX, ECS_FILE: '', ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let output = '';
@@ -272,7 +272,7 @@ test('health endpoint reports the version', async () => {
     assert.equal(response.status, 200);
     const body = await response.json();
     assert.equal(body.status, 'ok');
-    assert.equal(body.version, '1.6.0');
+    assert.equal(body.version, '1.7.0');
     assert.equal(body.ecs, '111.8.1.0/24');
     assert.equal(body.auth, true);
     assert.equal(body.suffix, TEST_SUFFIX);
@@ -334,7 +334,7 @@ test('locks the status API and reveals the URL only after token check', async ()
     const status = await fetch(relay.base + '/api/status', { headers: { cookie } });
     assert.equal(status.status, 200);
     const body = await status.json();
-    assert.equal(body.version, '1.6.0');
+    assert.equal(body.version, '1.7.0');
     assert.equal(body.auth, true);
     assert.equal(body.suffix, TEST_SUFFIX);
     assert.equal(body.stats.dohRequests, 1);
@@ -595,6 +595,78 @@ test('races upstreams and returns the first useful answer', async () => {
     slow.server.closeAllConnections?.();
     fast.server.close();
     slow.server.close();
+  }
+});
+
+test('updates the ECS subnet from the dashboard API', async () => {
+  const relay = await startRelay({
+    DOH_UPSTREAMS: mockUpstream,
+    WEB_PASSWORD: 'ui-password',
+    ECS_FILE: '',
+  });
+  try {
+    const unlock = await fetch(relay.base + '/api/unlock', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ password: 'ui-password' }),
+    });
+    assert.equal(unlock.status, 200);
+    const cookie = unlock.headers.get('set-cookie').split(';')[0];
+
+    let status = await fetch(relay.base + '/api/status', { headers: { cookie } });
+    assert.equal((await status.json()).ecs, '111.8.1.0/24');
+
+    const change = await fetch(relay.base + '/api/config/ecs', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ ecs: '111.8.0.0/16' }),
+    });
+    assert.equal(change.status, 200);
+    const changed = await change.json();
+    assert.equal(changed.ecs, '111.8.0.0/16');
+    assert.equal(changed.persisted, false);
+
+    status = await fetch(relay.base + '/api/status', { headers: { cookie } });
+    assert.equal((await status.json()).ecs, '111.8.0.0/16');
+
+    const query = buildQuery('example.com');
+    const doh = await fetch(`${relay.base}/${TEST_TOKEN}/${TEST_SUFFIX}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/dns-message' },
+      body: query,
+    });
+    assert.equal(doh.status, 200);
+    assert.deepEqual(findEcs(mock.requests.at(-1).query), {
+      family: 1,
+      source: 16,
+      scope: 0,
+      address: [111, 8],
+    });
+
+    const bad = await fetch(relay.base + '/api/config/ecs', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ ecs: 'not-a-cidr' }),
+    });
+    assert.equal(bad.status, 400);
+
+    const off = await fetch(relay.base + '/api/config/ecs', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ ecs: 'off' }),
+    });
+    assert.equal(off.status, 200);
+    assert.equal((await off.json()).ecs, 'off');
+
+    const doh2 = await fetch(`${relay.base}/${TEST_TOKEN}/${TEST_SUFFIX}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/dns-message' },
+      body: query,
+    });
+    assert.equal(doh2.status, 200);
+    assert.equal(findEcs(mock.requests.at(-1).query), null);
+  } finally {
+    await stopRelay(relay.child);
   }
 });
 
