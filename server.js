@@ -1,6 +1,6 @@
 'use strict';
 
-// Infrlo DoH relay — v1.7.0
+// Infrlo DoH relay — v1.8.0
 // RFC 8484 DNS-over-HTTPS relay. Infrlo expects the app on 0.0.0.0:5000.
 // Dependency-free on purpose: the platform only needs `node server.js`.
 
@@ -11,7 +11,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { buildEcsData, injectEcs } = require('./lib/ecs');
 
-const VERSION = '1.7.0';
+const VERSION = '1.8.0';
 const PORT = process.env.PORT === undefined || process.env.PORT === ''
   ? 5000
   : Number(process.env.PORT);
@@ -41,40 +41,64 @@ const RATE_LIMIT_PER_MIN = process.env.RATE_LIMIT_PER_MIN === undefined
   : Math.max(0, Number(process.env.RATE_LIMIT_PER_MIN) || 0);
 const UPSTREAM_TIMEOUT_MS = Math.max(500, Number(process.env.UPSTREAM_TIMEOUT_MS) || 3000);
 const MAX_BODY = 65535;
-// DOH_ECS is the initial default; the dashboard can override it at runtime.
-// The override is stored in ECS_FILE and takes precedence on restart.
+// ECS mode: custom injects ECS_CIDR; passthrough forwards the client's ECS.
+// ENV values are the defaults; the dashboard can override them at runtime and
+// the override is stored in ECS_FILE (takes precedence on restart).
 const ENV_ECS = process.env.DOH_ECS === undefined ? '111.8.1.0/24' : process.env.DOH_ECS.trim();
+const ENV_ECS_MODE = process.env.ECS_MODE === 'passthrough' || /^(off|none|0)$/i.test(ENV_ECS)
+  ? 'passthrough'
+  : 'custom';
 const ECS_FILE = process.env.ECS_FILE === undefined
   ? path.join(__dirname, 'data', 'ecs.txt')
   : process.env.ECS_FILE.trim();
-let ECS_CIDR = 'off';
+let ECS_MODE = 'custom';
+let ECS_CIDR = '111.8.1.0/24';
 let ECS_DATA = null;
 
-function applyEcsConfig(value) {
-  if (!value || /^(off|none|0)$/i.test(value)) {
-    ECS_CIDR = 'off';
-    ECS_DATA = null;
-    return;
-  }
+function setCustomEcs(value) {
   const data = buildEcsData(value);
   ECS_CIDR = value;
   ECS_DATA = data;
+  ECS_MODE = 'custom';
+}
+
+function setPassthroughEcs(value) {
+  if (value && !/^(off|none|0)$/i.test(value)) {
+    buildEcsData(value); // validate the remembered CIDR, but do not inject it
+    ECS_CIDR = value;
+  }
+  ECS_MODE = 'passthrough';
+  ECS_DATA = null;
 }
 
 function readEcsOverride() {
   if (!ECS_FILE) return null;
   try {
-    return fs.readFileSync(ECS_FILE, 'utf8').trim() || null;
+    const raw = fs.readFileSync(ECS_FILE, 'utf8').trim();
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        return {
+          mode: parsed.mode === 'passthrough' ? 'passthrough' : 'custom',
+          ecs: String(parsed.ecs || '').trim(),
+        };
+      }
+    } catch {}
+    return {
+      mode: /^(off|none|0)$/i.test(raw) ? 'passthrough' : 'custom',
+      ecs: raw,
+    };
   } catch {
     return null;
   }
 }
 
-function writeEcsOverride(value) {
+function writeEcsOverride() {
   if (!ECS_FILE) return false;
   try {
     fs.mkdirSync(path.dirname(ECS_FILE), { recursive: true });
-    fs.writeFileSync(ECS_FILE, value + '\n');
+    fs.writeFileSync(ECS_FILE, JSON.stringify({ mode: ECS_MODE, ecs: ECS_CIDR }) + '\n');
     return true;
   } catch (err) {
     console.error(`ecs override write failed: ${err.message}`);
@@ -86,18 +110,20 @@ const fileEcs = readEcsOverride();
 let initialEcsApplied = false;
 if (fileEcs) {
   try {
-    applyEcsConfig(fileEcs);
+    if (fileEcs.mode === 'passthrough') setPassthroughEcs(fileEcs.ecs || ENV_ECS);
+    else setCustomEcs(fileEcs.ecs || ENV_ECS);
     initialEcsApplied = true;
   } catch (err) {
-    console.error(`invalid ECS override (${fileEcs}): ${err.message}`);
+    console.error(`invalid ECS override (${fileEcs.mode}/${fileEcs.ecs}): ${err.message}`);
   }
 }
 if (!initialEcsApplied) {
   try {
-    applyEcsConfig(ENV_ECS);
+    if (ENV_ECS_MODE === 'passthrough') setPassthroughEcs(ENV_ECS);
+    else setCustomEcs(ENV_ECS);
   } catch (err) {
-    console.error(`invalid DOH_ECS (${ENV_ECS}): ${err.message}; ECS disabled`);
-    ECS_CIDR = 'off';
+    console.error(`invalid ECS config (${ENV_ECS_MODE}/${ENV_ECS}): ${err.message}; passthrough enabled`);
+    ECS_MODE = 'passthrough';
     ECS_DATA = null;
   }
 }
@@ -151,7 +177,9 @@ function statusPayload() {
     node: process.version,
     platform: process.platform,
     memory: { rss: memory.rss, heapUsed: memory.heapUsed },
-    ecs: ECS_DATA ? ECS_CIDR : 'off',
+    ecsMode: ECS_MODE,
+    ecs: ECS_CIDR,
+    ecsActive: ECS_MODE === 'custom' ? ECS_CIDR : 'off',
     suffix: DOH_SUFFIX,
     auth: true,
     rateLimitPerMin: RATE_LIMIT_PER_MIN,
@@ -567,17 +595,29 @@ function handleEcsConfig(req, res) {
   readJson(req, (err, body) => {
     if (err) return sendJson(res, 400, { error: 'bad_request' });
     const value = String((body && body.ecs) || '').trim();
-    if (!value) return sendJson(res, 400, { error: 'invalid_ecs', message: '请输入 IPv4 CIDR 或 off' });
+    // Older callers sent only {ecs:"off"}; keep that meaning as passthrough.
+    const mode = body && body.mode === 'passthrough'
+      ? 'passthrough'
+      : (body && body.mode === undefined && /^(off|none|0)$/i.test(value) ? 'passthrough' : 'custom');
+    if (mode === 'custom' && !value) {
+      return sendJson(res, 400, {
+        error: 'invalid_ecs',
+        message: '自定义模式需要填写 IPv4 CIDR，例如 111.8.1.0/24。',
+      });
+    }
     try {
-      applyEcsConfig(value);
+      if (mode === 'passthrough') setPassthroughEcs(value);
+      else setCustomEcs(value);
     } catch (e) {
       return sendJson(res, 400, {
         error: 'invalid_ecs',
-        message: 'ECS 网段格式错误，请使用 IPv4 CIDR（例如 111.8.1.0/24）或 off。',
+        message: mode === 'passthrough'
+          ? '透传模式不需要网段；如果填写，请使用有效 IPv4 CIDR（例如 111.8.1.0/24）。'
+          : 'ECS 网段格式错误，请使用 IPv4 CIDR（例如 111.8.1.0/24）。',
       });
     }
-    const persisted = writeEcsOverride(ECS_CIDR);
-    sendJson(res, 200, { ok: true, ecs: ECS_CIDR, persisted });
+    const persisted = writeEcsOverride();
+    sendJson(res, 200, { ok: true, ecsMode: ECS_MODE, ecs: ECS_CIDR, persisted });
   });
 }
 
@@ -618,7 +658,7 @@ function handle(req, res) {
         upstreams: UPSTREAMS.length,
         auth: true,
         suffix: DOH_SUFFIX,
-        ecs: ECS_DATA ? ECS_CIDR : 'off',
+        ecs: ECS_MODE === 'passthrough' ? 'passthrough' : ECS_CIDR,
       }),
       'application/json; charset=utf-8',
     );
@@ -770,7 +810,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`infrlo-doh-relay v${VERSION} listening on 0.0.0.0:${actualPort}`);
   console.log(`doh path: /<token>/${DOH_SUFFIX}`);
   console.log(`upstreams: ${UPSTREAMS.join(', ')}`);
-  console.log(`ecs: ${ECS_DATA ? ECS_CIDR : 'off'}`);
+  console.log(`ecs: ${ECS_MODE === 'passthrough' ? 'passthrough' : ECS_CIDR}`);
   console.log('token auth: required');
   if (RATE_LIMIT_PER_MIN) console.log(`rate limit: ${RATE_LIMIT_PER_MIN}/min per IP`);
 });

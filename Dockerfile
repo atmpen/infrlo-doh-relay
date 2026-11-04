@@ -1,7 +1,7 @@
 FROM node:20-alpine
 
 LABEL org.opencontainers.image.title="infrlo-doh-relay" \
-      org.opencontainers.image.version="1.7.0"
+      org.opencontainers.image.version="1.8.0"
 
 WORKDIR /app
 COPY --chown=node:node package.json server.js ./

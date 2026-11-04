@@ -1,8 +1,8 @@
 # infrlo-doh-relay
 
-v1.7.0 — a dependency-free [RFC 8484](https://www.rfc-editor.org/rfc/rfc8484) DNS-over-HTTPS relay, made for [Infrlo](https://infrlo.com/).
+v1.8.0 — a dependency-free [RFC 8484](https://www.rfc-editor.org/rfc/rfc8484) DNS-over-HTTPS relay, made for [Infrlo](https://infrlo.com/).
 
-It accepts DoH queries on `/<DOH_TOKEN>/weduolijia`, injects a fixed EDNS Client Subnet (ECS) into every upstream query, forwards the DNS wire message over HTTP/2, and returns the answer unchanged. The root URL serves a live status dashboard. No cache, no query logging, no npm dependencies.
+It accepts DoH queries on `/<DOH_TOKEN>/weduolijia`, applies the configured ECS policy (inject a fixed subnet, or pass the client's own ECS through), forwards the DNS wire message over HTTP/2, and returns the answer unchanged. The root URL serves a live status dashboard. No cache, no query logging, no npm dependencies.
 
 ## Endpoints
 
@@ -14,7 +14,7 @@ It accepts DoH queries on `/<DOH_TOKEN>/weduolijia`, injects a fixed EDNS Client
 | `POST` | `/api/unlock` | Exchange the homepage password for a session cookie |
 | `GET` | `/api/status` | Dashboard JSON (session cookie required) |
 | `POST` | `/api/reveal` | Validate the DoH token (session cookie required) |
-| `POST` | `/api/config/ecs` | Change the fixed ECS subnet (session cookie required) |
+| `POST` | `/api/config/ecs` | Switch ECS mode and change the custom subnet (session cookie required) |
 | `POST` | `/api/lock` | Clear the session |
 | `GET` | `/health` | Minimal JSON for monitoring (public) |
 
@@ -30,7 +30,11 @@ Open `https://<your-app-domain>/`. The page is in Chinese and starts with a pass
 - The dashboard shows version, uptime, Node runtime, memory, DoH request/success counters, ECS, rate limit, and per-upstream attempts/wins/errors/last RTT/last rcode.
 - The DNS endpoint is displayed with the token masked: `https://<app-domain>/••••••••/weduolijia`.
 - Clicking 复制 opens a DoH token prompt. The server validates the token; on success the browser copies the full URL to the clipboard, on failure it shows a warning.
-- The ECS card has an 编辑 button. Enter an IPv4 CIDR (for example `111.8.1.0/24`) or `off`; the change applies to subsequent queries immediately. It is written to `ECS_FILE` and takes precedence over `DOH_ECS` on restart when the file is writable.
+- The ECS card shows either the injected subnet or 透传, with an 编辑 button. The editor has a mode selector:
+  - 自定义 ECS — inject the IPv4 CIDR shown in the input (for example `111.8.1.0/24`). The relay replaces any ECS the client sent.
+  - 透传客户端 ECS — do not inject anything; a client-supplied ECS reaches the upstream unchanged, and a query without ECS stays without one.
+
+  The change applies to subsequent queries immediately. When `ECS_FILE` is writable, it is persisted there and takes precedence over `DOH_ECS`/`ECS_MODE` on restart.
 - A dark/light theme toggle is persisted in `localStorage`; 锁定 clears the session.
 
 `/api/status`, `/api/reveal`, and `/api/config/ecs` require the session cookie; `/api/reveal` additionally requires the correct DoH token. `/health` stays public for monitoring and contains no secrets.
@@ -48,7 +52,7 @@ In the Infrlo dashboard, **Deploy → From Public URL** and use:
 
 Set `DOH_TOKEN` to your secret in the environment variables section. **The relay refuses to start without it** — this is deliberate, so it cannot accidentally run as an open resolver. Optionally set `WEB_PASSWORD` to use a different password for the dashboard; if omitted, the homepage password is the DoH token.
 
-Then open `https://<your-app-domain>/health`; it should return JSON with `"version":"1.7.0"`.
+Then open `https://<your-app-domain>/health`; it should return JSON with `"version":"1.8.0"`.
 
 The `Dockerfile` is included for platforms that build images directly. It pins Node 20 and runs as the non-root `node` user.
 
@@ -68,8 +72,9 @@ The `Dockerfile` is included for platforms that build images directly. It pins N
 | `DOH_TOKEN` | **required** | Secret path segment. The DoH URL is `/<DOH_TOKEN>/<DOH_SUFFIX>`. Never commit it to the repo. |
 | `WEB_PASSWORD` | `DOH_TOKEN` | Homepage password. Set a separate value if the dashboard password should differ from the DoH token. |
 | `DOH_SUFFIX` | `weduolijia` | Last path segment; must be a single path segment. |
-| `DOH_ECS` | `111.8.1.0/24` | Initial IPv4 ECS injected into every upstream query (Hunan Mobile, Changsha). `off` disables injection and passes the client's own ECS through. The dashboard can override it at runtime. |
-| `ECS_FILE` | `data/ecs.txt` | File written by the dashboard's ECS editor. When present and readable, it takes precedence over `DOH_ECS` on restart. Set it to an empty string to disable persistence. |
+| `ECS_MODE` | `custom` | `custom` injects `DOH_ECS`; `passthrough` forwards the client's own ECS untouched. |
+| `DOH_ECS` | `111.8.1.0/24` | IPv4 ECS used in `custom` mode (Hunan Mobile, Changsha). The legacy value `off` selects `passthrough`. The dashboard can override both at runtime. |
+| `ECS_FILE` | `data/ecs.txt` | File written by the dashboard's ECS editor as `{"mode":"custom","ecs":"…"}`. When present and readable, it takes precedence over `ECS_MODE`/`DOH_ECS` on restart. Legacy plain-text files (`<cidr>` or `off`) are still accepted. Set it to an empty string to disable persistence. |
 | `DOH_UPSTREAMS` | Quad9 dns11, Google | Comma-separated DoH URLs; all queried in parallel. |
 | `RATE_LIMIT_PER_MIN` | `600` | Per-IP requests per minute. `0` disables the limiter. |
 | `UPSTREAM_TIMEOUT_MS` | `3000` | Per-upstream timeout before trying the next one. |
@@ -89,9 +94,9 @@ AdGuard unfiltered is no longer a default. It echoes ECS with `scope=24`, but fo
 
 Racing optimizes latency, not ECS quality: whichever upstream answers first wins. If Google answers first without honoring ECS, the result may not be a Hunan Mobile address. For consistent ECS results, set `DOH_UPSTREAMS` to Quad9 dns11 only.
 
-The default ECS is `111.8.1.0/24` (Hunan Mobile, Changsha, AS56047). Change it with `DOH_ECS`, for example `221.176.1.0/24` (Beijing Mobile) or `120.196.1.0/24` (Shanghai Mobile). Use `DOH_ECS=off` if you want the client's own ECS to pass through untouched.
+The default ECS is `111.8.1.0/24` (Hunan Mobile, Changsha, AS56047). Change it with `DOH_ECS`, for example `221.176.1.0/24` (Beijing Mobile) or `120.196.1.0/24` (Shanghai Mobile). Set `ECS_MODE=passthrough` (or the legacy `DOH_ECS=off`) to forward the client's own ECS untouched.
 
-The relay replaces any ECS the client sent; it does not merge options. Other EDNS options (including the DNSSEC DO bit) are preserved.
+In `custom` mode the relay replaces any ECS the client sent and preserves other EDNS options (including the DNSSEC DO bit). In `passthrough` mode the query is forwarded exactly as received.
 
 ## Use with mihomo
 

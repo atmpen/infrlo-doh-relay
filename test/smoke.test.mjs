@@ -272,7 +272,7 @@ test('health endpoint reports the version', async () => {
     assert.equal(response.status, 200);
     const body = await response.json();
     assert.equal(body.status, 'ok');
-    assert.equal(body.version, '1.7.0');
+    assert.equal(body.version, '1.8.0');
     assert.equal(body.ecs, '111.8.1.0/24');
     assert.equal(body.auth, true);
     assert.equal(body.suffix, TEST_SUFFIX);
@@ -334,7 +334,7 @@ test('locks the status API and reveals the URL only after token check', async ()
     const status = await fetch(relay.base + '/api/status', { headers: { cookie } });
     assert.equal(status.status, 200);
     const body = await status.json();
-    assert.equal(body.version, '1.7.0');
+    assert.equal(body.version, '1.8.0');
     assert.equal(body.auth, true);
     assert.equal(body.suffix, TEST_SUFFIX);
     assert.equal(body.stats.dohRequests, 1);
@@ -598,7 +598,7 @@ test('races upstreams and returns the first useful answer', async () => {
   }
 });
 
-test('updates the ECS subnet from the dashboard API', async () => {
+test('dashboard switches ECS between custom and passthrough', async () => {
   const relay = await startRelay({
     DOH_UPSTREAMS: mockUpstream,
     WEB_PASSWORD: 'ui-password',
@@ -613,58 +613,85 @@ test('updates the ECS subnet from the dashboard API', async () => {
     assert.equal(unlock.status, 200);
     const cookie = unlock.headers.get('set-cookie').split(';')[0];
 
-    let status = await fetch(relay.base + '/api/status', { headers: { cookie } });
-    assert.equal((await status.json()).ecs, '111.8.1.0/24');
+    const postEcs = async (payload) => {
+      const response = await fetch(relay.base + '/api/config/ecs', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie },
+        body: JSON.stringify(payload),
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    const statusBody = async () => {
+      const response = await fetch(relay.base + '/api/status', { headers: { cookie } });
+      return response.json();
+    };
+    const upstreamQuery = async (query) => {
+      const response = await dohPost(relay.base, query);
+      assert.equal(response.status, 200);
+      return mock.requests.at(-1).query;
+    };
 
-    const change = await fetch(relay.base + '/api/config/ecs', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', cookie },
-      body: JSON.stringify({ ecs: '111.8.0.0/16' }),
-    });
+    const initial = await statusBody();
+    assert.equal(initial.ecsMode, 'custom');
+    assert.equal(initial.ecs, '111.8.1.0/24');
+    assert.equal(initial.ecsActive, '111.8.1.0/24');
+
+    const change = await postEcs({ mode: 'custom', ecs: '111.8.0.0/16' });
     assert.equal(change.status, 200);
-    const changed = await change.json();
-    assert.equal(changed.ecs, '111.8.0.0/16');
-    assert.equal(changed.persisted, false);
+    assert.equal(change.body.ecsMode, 'custom');
+    assert.equal(change.body.ecs, '111.8.0.0/16');
+    assert.equal(change.body.persisted, false);
 
-    status = await fetch(relay.base + '/api/status', { headers: { cookie } });
-    assert.equal((await status.json()).ecs, '111.8.0.0/16');
+    const customStatus = await statusBody();
+    assert.equal(customStatus.ecsMode, 'custom');
+    assert.equal(customStatus.ecs, '111.8.0.0/16');
+    assert.equal(customStatus.ecsActive, '111.8.0.0/16');
 
     const query = buildQuery('example.com');
-    const doh = await fetch(`${relay.base}/${TEST_TOKEN}/${TEST_SUFFIX}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/dns-message' },
-      body: query,
-    });
-    assert.equal(doh.status, 200);
-    assert.deepEqual(findEcs(mock.requests.at(-1).query), {
+    assert.deepEqual(findEcs(await upstreamQuery(query)), {
       family: 1,
       source: 16,
       scope: 0,
       address: [111, 8],
     });
 
-    const bad = await fetch(relay.base + '/api/config/ecs', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', cookie },
-      body: JSON.stringify({ ecs: 'not-a-cidr' }),
-    });
+    const bad = await postEcs({ mode: 'custom', ecs: 'not-a-cidr' });
     assert.equal(bad.status, 400);
 
-    const off = await fetch(relay.base + '/api/config/ecs', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', cookie },
-      body: JSON.stringify({ ecs: 'off' }),
-    });
-    assert.equal(off.status, 200);
-    assert.equal((await off.json()).ecs, 'off');
+    const passthrough = await postEcs({ mode: 'passthrough', ecs: '111.8.0.0/16' });
+    assert.equal(passthrough.status, 200);
+    assert.equal(passthrough.body.ecsMode, 'passthrough');
+    assert.equal(passthrough.body.ecs, '111.8.0.0/16');
 
-    const doh2 = await fetch(`${relay.base}/${TEST_TOKEN}/${TEST_SUFFIX}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/dns-message' },
-      body: query,
+    const passStatus = await statusBody();
+    assert.equal(passStatus.ecsMode, 'passthrough');
+    assert.equal(passStatus.ecs, '111.8.0.0/16');
+    assert.equal(passStatus.ecsActive, 'off');
+
+    assert.equal(findEcs(await upstreamQuery(query)), null);
+
+    const clientQuery = buildQueryWithOpt('example.com', '8.8.8.0/24');
+    assert.deepEqual(findEcs(await upstreamQuery(clientQuery)), {
+      family: 1,
+      source: 24,
+      scope: 0,
+      address: [8, 8, 8],
     });
-    assert.equal(doh2.status, 200);
-    assert.equal(findEcs(mock.requests.at(-1).query), null);
+
+    const backToCustom = await postEcs({ mode: 'custom', ecs: '111.8.1.0/24' });
+    assert.equal(backToCustom.status, 200);
+    assert.equal(backToCustom.body.ecsMode, 'custom');
+    assert.deepEqual(findEcs(await upstreamQuery(clientQuery)), {
+      family: 1,
+      source: 24,
+      scope: 0,
+      address: [111, 8, 1],
+    });
+
+    const off = await postEcs({ ecs: 'off' });
+    assert.equal(off.status, 200);
+    assert.equal(off.body.ecsMode, 'passthrough');
+    assert.equal(findEcs(await upstreamQuery(query)), null);
   } finally {
     await stopRelay(relay.child);
   }

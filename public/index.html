@@ -161,12 +161,13 @@
   .login-card .mark { margin: 0 auto 16px; width: 52px; height: 52px; font-size: 23px; border-radius: 16px; }
   .login-card p { margin: 6px 0 20px; }
   .login-card form { display: grid; gap: 10px; }
-  input {
+  input, select {
     width: 100%; font: inherit; font-size: 13.5px; color: var(--text);
     background: var(--panel-solid); border: 1px solid var(--line); border-radius: 10px;
     padding: 11px 12px; outline: none;
   }
-  input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
+  select { cursor: pointer; }
+  input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
   .login-card button[type="submit"] { background: var(--accent); border-color: var(--accent); color: #fff; }
   .error { color: var(--red); font-size: 12.5px; margin: 12px 0 0; }
   .success { color: var(--green); font-size: 12.5px; margin: 12px 0 0; }
@@ -230,7 +231,7 @@
       <div class="card"><div class="k">运行时长</div><div class="v" id="uptime">—</div><div class="hint" id="started">—</div></div>
       <div class="card"><div class="k">DoH 请求</div><div class="v" id="requests">—</div><div class="hint" id="last-request">—</div></div>
       <div class="card"><div class="k">成功率</div><div class="v" id="success">—</div><div class="hint" id="errors">—</div></div>
-      <div class="card"><div class="k">ECS</div><div class="v small" id="ecs">—</div><div class="hint">固定客户端网段 · <button id="ecs-edit" type="button" class="link">编辑</button></div></div>
+      <div class="card"><div class="k">ECS</div><div class="v small" id="ecs">—</div><div class="hint"><span id="ecs-hint">固定客户端网段</span> · <button id="ecs-edit" type="button" class="link">编辑</button></div></div>
       <div class="card"><div class="k">上游</div><div class="v" id="upstream-count">—</div><div class="hint">并行竞速</div></div>
       <div class="card"><div class="k">限流</div><div class="v small" id="rate-limit">—</div><div class="hint">按客户端 IP</div></div>
       <div class="card"><div class="k">内存</div><div class="v small" id="memory">—</div><div class="hint" id="platform">—</div></div>
@@ -290,10 +291,14 @@
 
 <div class="modal" id="ecs-modal" hidden>
   <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="ecs-title">
-    <h3 id="ecs-title">自定义 ECS 网段</h3>
-    <p class="muted">支持 IPv4 CIDR，例如 111.8.1.0/24；填 off 可关闭 ECS。</p>
+    <h3 id="ecs-title">ECS 设置</h3>
+    <p class="muted">自定义模式会注入下面的网段；透传模式保留客户端自带的 ECS，不注入。</p>
     <form id="ecs-form">
-      <input id="ecs-input" placeholder="111.8.1.0/24 或 off" required>
+      <select id="ecs-mode">
+        <option value="custom">自定义 ECS</option>
+        <option value="passthrough">透传客户端 ECS</option>
+      </select>
+      <input id="ecs-input" placeholder="111.8.1.0/24" autocomplete="off">
       <div class="modal-actions">
         <button type="button" id="ecs-cancel">取消</button>
         <button type="submit" id="ecs-submit">保存</button>
@@ -366,7 +371,13 @@
     const rate = data.stats.dohRequests ? Math.round((data.stats.dohOk / data.stats.dohRequests) * 100) : null;
     $('success').textContent = rate == null ? '—' : `${rate}%`;
     $('errors').textContent = `${data.stats.dohErrors} 上游错误 · ${data.stats.authFailures} 鉴权失败`;
-    $('ecs').textContent = data.ecs;
+    if (data.ecsMode === 'passthrough') {
+      $('ecs').textContent = '透传';
+      $('ecs-hint').textContent = '客户端 ECS 原样转发';
+    } else {
+      $('ecs').textContent = data.ecs;
+      $('ecs-hint').textContent = '固定客户端网段';
+    }
     $('upstream-count').textContent = data.upstreams.length;
     $('rate-limit').textContent = data.rateLimitPerMin ? `${data.rateLimitPerMin}/分钟` : '关闭';
     $('memory').textContent = `${fmtBytes(data.memory.rss)} RSS`;
@@ -486,7 +497,8 @@
 
   const openEcsModal = () => {
     $('ecs-modal').hidden = false;
-    $('ecs-input').value = (statusData && statusData.ecs) || 'off';
+    $('ecs-mode').value = (statusData && statusData.ecsMode) || 'custom';
+    $('ecs-input').value = (statusData && statusData.ecs) || '111.8.1.0/24';
     $('ecs-error').hidden = true;
     $('ecs-success').hidden = true;
     setTimeout(() => $('ecs-input').focus(), 50);
@@ -502,7 +514,7 @@
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ ecs: $('ecs-input').value }),
+        body: JSON.stringify({ mode: $('ecs-mode').value, ecs: $('ecs-input').value }),
       });
       if (res.status === 401) {
         showLogin();
@@ -516,9 +528,10 @@
         return;
       }
       const data = await res.json();
+      const modeText = data.ecsMode === 'passthrough' ? '已切换到透传模式' : '已保存并生效';
       $('ecs-success').textContent = data.persisted
-        ? '已保存并生效。'
-        : '已生效；当前环境未持久化，重启后可能恢复默认。';
+        ? `${modeText}。`
+        : `${modeText}；当前环境未持久化，重启后可能恢复默认。`;
       $('ecs-success').hidden = false;
       await load();
       setTimeout(closeEcsModal, 1200);
