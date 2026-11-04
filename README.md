@@ -1,6 +1,6 @@
 # infrlo-doh-relay
 
-v1.5.0 — a dependency-free [RFC 8484](https://www.rfc-editor.org/rfc/rfc8484) DNS-over-HTTPS relay, made for [Infrlo](https://infrlo.com/).
+v1.6.0 — a dependency-free [RFC 8484](https://www.rfc-editor.org/rfc/rfc8484) DNS-over-HTTPS relay, made for [Infrlo](https://infrlo.com/).
 
 It accepts DoH queries on `/<DOH_TOKEN>/weduolijia`, injects a fixed EDNS Client Subnet (ECS) into every upstream query, forwards the DNS wire message over HTTP/2, and returns the answer unchanged. The root URL serves a live status dashboard. No cache, no query logging, no npm dependencies.
 
@@ -10,8 +10,11 @@ It accepts DoH queries on `/<DOH_TOKEN>/weduolijia`, injects a fixed EDNS Client
 | --- | --- | --- |
 | `POST` | `/<DOH_TOKEN>/weduolijia` | DoH query body (`content-type: application/dns-message`) |
 | `GET` | `/<DOH_TOKEN>/weduolijia?dns=<base64url>` | DoH query in the URL |
-| `GET` | `/` | Live status dashboard (public, token never shown) |
-| `GET` | `/api/status` | JSON consumed by the dashboard (public) |
+| `GET` | `/` | Status page HTML with a password gate (public HTML, data locked) |
+| `POST` | `/api/unlock` | Exchange the homepage password for a session cookie |
+| `GET` | `/api/status` | Dashboard JSON (session cookie required) |
+| `POST` | `/api/reveal` | Validate the DoH token (session cookie required) |
+| `POST` | `/api/lock` | Clear the session |
 | `GET` | `/health` | Minimal JSON for monitoring (public) |
 
 The token is a path segment and is checked **before** rate limiting, DNS parsing, ECS injection, or any upstream request. There is no `/dns-query` alias; the suffix is controlled by `DOH_SUFFIX` and defaults to `weduolijia`.
@@ -20,14 +23,15 @@ The server listens on `0.0.0.0:5000` (`PORT` overrides), which is what Infrlo ex
 
 ## Web UI
 
-Open `https://<your-app-domain>/` to see the dashboard:
+Open `https://<your-app-domain>/`. The page is in Chinese and starts with a password gate:
 
-- Version, uptime, Node runtime, memory
-- DoH request count, success rate, auth failures, rate-limit hits
-- Fixed ECS and rate limit
-- Per-upstream attempts, wins, errors, last RTT and last rcode
+- `WEB_PASSWORD` (defaults to `DOH_TOKEN`) unlocks the dashboard for 12 hours with an HttpOnly, SameSite=Strict session cookie.
+- The dashboard shows version, uptime, Node runtime, memory, DoH request/success counters, ECS, rate limit, and per-upstream attempts/wins/errors/last RTT/last rcode.
+- The DNS endpoint is displayed with the token masked: `https://<app-domain>/••••••••/weduolijia`.
+- Clicking 复制 opens a DoH token prompt. The server validates the token; on success the browser copies the full URL to the clipboard, on failure it shows a warning.
+- A dark/light theme toggle is persisted in `localStorage`; 锁定 clears the session.
 
-It refreshes every 5 seconds and is served by the same process. The dashboard and `/api/status` are public, but neither contains `DOH_TOKEN`; the endpoint is shown as `/<token>/weduolijia`.
+`/api/status` and `/api/reveal` require the session cookie; `/api/reveal` additionally requires the correct DoH token. `/health` stays public for monitoring and contains no secrets.
 
 ## Deploy on Infrlo
 
@@ -40,9 +44,9 @@ In the Infrlo dashboard, **Deploy → From Public URL** and use:
 | Build command | `npm install` |
 | Run command | `sh start.sh` |
 
-Set `DOH_TOKEN` to your secret in the environment variables section. **The relay refuses to start without it** — this is deliberate, so it cannot accidentally run as an open resolver.
+Set `DOH_TOKEN` to your secret in the environment variables section. **The relay refuses to start without it** — this is deliberate, so it cannot accidentally run as an open resolver. Optionally set `WEB_PASSWORD` to use a different password for the dashboard; if omitted, the homepage password is the DoH token.
 
-Then open `https://<your-app-domain>/health`; it should return JSON with `"version":"1.5.0"`.
+Then open `https://<your-app-domain>/health`; it should return JSON with `"version":"1.6.0"`.
 
 The `Dockerfile` is included for platforms that build images directly. It pins Node 20 and runs as the non-root `node` user.
 
@@ -60,6 +64,7 @@ The `Dockerfile` is included for platforms that build images directly. It pins N
 | Name | Default | Meaning |
 | --- | --- | --- |
 | `DOH_TOKEN` | **required** | Secret path segment. The DoH URL is `/<DOH_TOKEN>/<DOH_SUFFIX>`. Never commit it to the repo. |
+| `WEB_PASSWORD` | `DOH_TOKEN` | Homepage password. Set a separate value if the dashboard password should differ from the DoH token. |
 | `DOH_SUFFIX` | `weduolijia` | Last path segment; must be a single path segment. |
 | `DOH_ECS` | `111.8.1.0/24` | Fixed IPv4 ECS injected into every upstream query (Hunan Mobile, Changsha). `off` disables injection and passes the client's own ECS through. |
 | `DOH_UPSTREAMS` | Quad9 dns11, Google | Comma-separated DoH URLs; all queried in parallel. |

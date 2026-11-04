@@ -1,15 +1,21 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Infrlo DoH Relay — Status</title>
+<title>Infrlo DoH 中转 — 运行状态</title>
+<script>
+  try {
+    const saved = localStorage.getItem('idr-theme');
+    if (saved === 'light' || saved === 'dark') document.documentElement.dataset.theme = saved;
+  } catch {}
+</script>
 <style>
   :root {
-    color-scheme: light dark;
+    color-scheme: light;
     --bg: #f5f6fb;
     --bg-2: #eef0f8;
-    --panel: rgba(255,255,255,.86);
+    --panel: rgba(255,255,255,.88);
     --panel-solid: #ffffff;
     --text: #111827;
     --muted: #667085;
@@ -20,13 +26,33 @@
     --red: #dc2626;
     --red-bg: #fef2f2;
     --amber: #b45309;
+    --overlay: rgba(17,24,39,.38);
     --shadow: 0 18px 50px rgba(17,24,39,.08);
   }
+  html[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0b0f17;
+    --bg-2: #0f1522;
+    --panel: rgba(17,24,39,.74);
+    --panel-solid: #111827;
+    --text: #f3f4f6;
+    --muted: #98a2b3;
+    --line: #1f2937;
+    --accent: #a78bfa;
+    --green: #34d399;
+    --green-bg: rgba(16,185,129,.12);
+    --red: #f87171;
+    --red-bg: rgba(239,68,68,.12);
+    --amber: #fbbf24;
+    --overlay: rgba(0,0,0,.62);
+    --shadow: 0 18px 50px rgba(0,0,0,.35);
+  }
   @media (prefers-color-scheme: dark) {
-    :root {
+    html:not([data-theme="light"]) {
+      color-scheme: dark;
       --bg: #0b0f17;
       --bg-2: #0f1522;
-      --panel: rgba(17,24,39,.72);
+      --panel: rgba(17,24,39,.74);
       --panel-solid: #111827;
       --text: #f3f4f6;
       --muted: #98a2b3;
@@ -37,21 +63,23 @@
       --red: #f87171;
       --red-bg: rgba(239,68,68,.12);
       --amber: #fbbf24;
+      --overlay: rgba(0,0,0,.62);
       --shadow: 0 18px 50px rgba(0,0,0,.35);
     }
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   body {
     margin: 0;
     min-height: 100vh;
-    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
     color: var(--text);
     background:
       radial-gradient(circle at 12% 0%, rgba(124,58,237,.13), transparent 34rem),
       radial-gradient(circle at 88% 8%, rgba(59,130,246,.10), transparent 30rem),
       linear-gradient(180deg, var(--bg), var(--bg-2));
   }
-  .wrap { max-width: 1120px; margin: 0 auto; padding: 40px 20px 56px; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 36px 20px 56px; }
   .hero { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 26px; }
   .brand { display: flex; align-items: center; gap: 14px; }
   .mark {
@@ -63,6 +91,7 @@
   }
   h1 { font-size: 21px; line-height: 1.15; margin: 0; letter-spacing: -.3px; }
   .sub { margin: 3px 0 0; color: var(--muted); font-size: 12.5px; }
+  .actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
   .pill {
     display: inline-flex; align-items: center; gap: 8px;
     padding: 9px 13px; border-radius: 999px;
@@ -82,7 +111,7 @@
     padding: 16px 16px 15px; box-shadow: var(--shadow);
     backdrop-filter: blur(10px);
   }
-  .card .k { color: var(--muted); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
+  .card .k { color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .08em; }
   .card .v { margin-top: 8px; font-size: 20px; font-weight: 750; letter-spacing: -.4px; font-variant-numeric: tabular-nums; }
   .card .v.small { font-size: 15px; word-break: break-word; }
   .card .hint { margin-top: 5px; color: var(--muted); font-size: 11.5px; }
@@ -93,17 +122,18 @@
   }
   .panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 18px 20px 14px; border-bottom: 1px solid var(--line); }
   h2 { margin: 0; font-size: 15px; letter-spacing: -.2px; }
+  h3 { margin: 0 0 6px; font-size: 17px; letter-spacing: -.2px; }
   .muted { color: var(--muted); font-size: 12px; }
   .table-wrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); padding: 11px 20px; background: color-mix(in srgb, var(--panel-solid) 70%, transparent); }
+  th { text-align: left; font-size: 10.5px; letter-spacing: .07em; color: var(--muted); padding: 11px 20px; background: color-mix(in srgb, var(--panel-solid) 70%, transparent); }
   td { padding: 13px 20px; border-top: 1px solid var(--line); font-variant-numeric: tabular-nums; }
   tbody tr:hover { background: color-mix(in srgb, var(--accent) 4%, transparent); }
   .host { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; font-weight: 650; }
   .bad { color: var(--red); }
   .good { color: var(--green); }
   .endpoint { padding: 18px 20px 20px; display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
-  .endpoint code {
+  .endpoint code, .masked {
     display: inline-block; padding: 10px 13px; border-radius: 10px;
     background: color-mix(in srgb, var(--accent) 8%, var(--panel-solid));
     border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--line));
@@ -114,13 +144,47 @@
   button {
     font: inherit; font-size: 12px; font-weight: 650; color: var(--text);
     background: var(--panel-solid); border: 1px solid var(--line); border-radius: 9px;
-    padding: 8px 12px; cursor: pointer; transition: border-color .15s, transform .15s;
+    padding: 8px 12px; cursor: pointer; transition: border-color .15s, transform .15s, opacity .15s;
   }
   button:hover { border-color: var(--accent); transform: translateY(-1px); }
+  button:disabled { opacity: .55; cursor: wait; transform: none; }
+  button.ghost { background: transparent; box-shadow: none; }
+  .login-wrap { display: grid; place-items: center; padding: 10vh 0 12vh; }
+  .login-card {
+    width: min(400px, 100%);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 22px;
+    padding: 30px 28px 28px; box-shadow: var(--shadow); backdrop-filter: blur(12px);
+    text-align: center;
+  }
+  .login-card .mark { margin: 0 auto 16px; width: 52px; height: 52px; font-size: 23px; border-radius: 16px; }
+  .login-card p { margin: 6px 0 20px; }
+  .login-card form { display: grid; gap: 10px; }
+  input {
+    width: 100%; font: inherit; font-size: 13.5px; color: var(--text);
+    background: var(--panel-solid); border: 1px solid var(--line); border-radius: 10px;
+    padding: 11px 12px; outline: none;
+  }
+  input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
+  .login-card button[type="submit"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .error { color: var(--red); font-size: 12.5px; margin: 12px 0 0; }
+  .success { color: var(--green); font-size: 12.5px; margin: 12px 0 0; }
+  .modal {
+    position: fixed; inset: 0; z-index: 50; display: grid; place-items: center;
+    background: var(--overlay); backdrop-filter: blur(5px); padding: 20px;
+  }
+  .modal-card {
+    width: min(420px, 100%);
+    background: var(--panel-solid); border: 1px solid var(--line); border-radius: 20px;
+    padding: 26px 24px 22px; box-shadow: 0 30px 80px rgba(0,0,0,.28);
+  }
+  .modal-card form { display: grid; gap: 12px; margin-top: 16px; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .modal-actions button[type="submit"] { background: var(--accent); border-color: var(--accent); color: #fff; }
   .empty { padding: 28px 20px; text-align: center; color: var(--muted); font-size: 12.5px; }
   @media (max-width: 640px) {
     .wrap { padding: 24px 14px 40px; }
     .hero { align-items: flex-start; flex-direction: column; }
+    .actions { justify-content: flex-start; }
     .card .v { font-size: 18px; }
     th, td { padding-left: 14px; padding-right: 14px; }
   }
@@ -132,70 +196,109 @@
     <div class="brand">
       <div class="mark">D</div>
       <div>
-        <h1>Infrlo DoH Relay</h1>
-        <p class="sub">DNS-over-HTTPS status</p>
+        <h1>Infrlo DoH 中转</h1>
+        <p class="sub">DNS-over-HTTPS 运行状态</p>
       </div>
     </div>
-    <div class="pill" id="pill" role="status" aria-live="polite">
-      <span class="dot"></span><span id="pill-text">Connecting…</span>
+    <div class="actions">
+      <button id="theme-toggle" type="button" class="ghost">暗色</button>
+      <button id="lock-btn" type="button" class="ghost" hidden>锁定</button>
+      <div class="pill" id="pill" role="status" aria-live="polite">
+        <span class="dot"></span><span id="pill-text">检查中…</span>
+      </div>
     </div>
   </header>
 
-  <section class="grid">
-    <div class="card"><div class="k">Version</div><div class="v" id="version">—</div><div class="hint" id="node">—</div></div>
-    <div class="card"><div class="k">Uptime</div><div class="v" id="uptime">—</div><div class="hint" id="started">—</div></div>
-    <div class="card"><div class="k">DoH requests</div><div class="v" id="requests">—</div><div class="hint" id="last-request">—</div></div>
-    <div class="card"><div class="k">Success rate</div><div class="v" id="success">—</div><div class="hint" id="errors">—</div></div>
-    <div class="card"><div class="k">ECS</div><div class="v small" id="ecs">—</div><div class="hint">Fixed client subnet</div></div>
-    <div class="card"><div class="k">Upstreams</div><div class="v" id="upstream-count">—</div><div class="hint">Raced in parallel</div></div>
-    <div class="card"><div class="k">Rate limit</div><div class="v small" id="rate-limit">—</div><div class="hint">Per client IP</div></div>
-    <div class="card"><div class="k">Memory</div><div class="v small" id="memory">—</div><div class="hint" id="platform">—</div></div>
-  </section>
-
-  <section class="panel">
-    <div class="panel-head">
-      <h2>Upstreams</h2>
-      <span class="muted" id="updated">—</span>
-    </div>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr><th>Host</th><th>Attempts</th><th>Wins</th><th>Errors</th><th>Last RTT</th><th>Last result</th></tr>
-        </thead>
-        <tbody id="upstreams">
-          <tr><td colspan="6" class="empty">Loading…</td></tr>
-        </tbody>
-      </table>
+  <section id="login-view" class="login-wrap">
+    <div class="login-card">
+      <div class="mark">D</div>
+      <h2>需要密码访问</h2>
+      <p class="muted">请输入主页密码查看运行状态。</p>
+      <form id="login-form">
+        <input id="login-password" type="password" autocomplete="current-password" placeholder="主页密码" required>
+        <button type="submit" id="login-submit">进入</button>
+      </form>
+      <p class="error" id="login-error" hidden></p>
     </div>
   </section>
 
-  <section class="panel">
-    <div class="panel-head">
-      <h2>DoH endpoint</h2>
-      <span class="muted">token required</span>
-    </div>
-    <div class="endpoint">
-      <code id="doh-path">/&lt;token&gt;/weduolijia</code>
-      <span class="muted">The token is never shown on this page.</span>
-    </div>
-  </section>
+  <div id="dashboard-view" hidden>
+    <section class="grid">
+      <div class="card"><div class="k">版本</div><div class="v" id="version">—</div><div class="hint" id="node">—</div></div>
+      <div class="card"><div class="k">运行时长</div><div class="v" id="uptime">—</div><div class="hint" id="started">—</div></div>
+      <div class="card"><div class="k">DoH 请求</div><div class="v" id="requests">—</div><div class="hint" id="last-request">—</div></div>
+      <div class="card"><div class="k">成功率</div><div class="v" id="success">—</div><div class="hint" id="errors">—</div></div>
+      <div class="card"><div class="k">ECS</div><div class="v small" id="ecs">—</div><div class="hint">固定客户端网段</div></div>
+      <div class="card"><div class="k">上游</div><div class="v" id="upstream-count">—</div><div class="hint">并行竞速</div></div>
+      <div class="card"><div class="k">限流</div><div class="v small" id="rate-limit">—</div><div class="hint">按客户端 IP</div></div>
+      <div class="card"><div class="k">内存</div><div class="v small" id="memory">—</div><div class="hint" id="platform">—</div></div>
+    </section>
 
-  <footer class="foot">
-    <span>Auto-refresh every 5s</span>
-    <button id="refresh" type="button">Refresh now</button>
-  </footer>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>上游状态</h2>
+        <span class="muted" id="updated">—</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>上游</th><th>请求次数</th><th>胜出</th><th>错误</th><th>最近延迟</th><th>最近结果</th></tr>
+          </thead>
+          <tbody id="upstreams">
+            <tr><td colspan="6" class="empty">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>DNS 地址</h2>
+        <span class="muted">token 已打码</span>
+      </div>
+      <div class="endpoint">
+        <code id="masked-url">https://…/••••••••/weduolijia</code>
+        <button id="copy-open" type="button">复制</button>
+        <span class="muted">点击复制时需要输入 DoH Token 校验。</span>
+      </div>
+    </section>
+
+    <footer class="foot">
+      <span>每 5 秒自动刷新</span>
+      <button id="refresh" type="button">立即刷新</button>
+    </footer>
+  </div>
 </main>
+
+<div class="modal" id="copy-modal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="copy-title">
+    <h3 id="copy-title">复制 DNS 地址</h3>
+    <p class="muted">请输入 DoH Token，校验通过后复制完整地址。</p>
+    <form id="copy-form">
+      <input id="token-input" type="password" autocomplete="off" placeholder="DoH Token" required>
+      <div class="modal-actions">
+        <button type="button" id="copy-cancel">取消</button>
+        <button type="submit" id="copy-submit">校验并复制</button>
+      </div>
+    </form>
+    <p class="error" id="copy-error" hidden></p>
+    <p class="success" id="copy-success" hidden></p>
+  </div>
+</div>
+
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
   const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  let statusData = null;
+
   const fmtUptime = (sec) => {
     sec = Math.max(0, Math.floor(sec));
     const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
-    if (d) return `${d}d ${h}h`;
-    if (h) return `${h}h ${m}m`;
-    if (m) return `${m}m ${s}s`;
-    return `${s}s`;
+    if (d) return `${d} 天 ${h} 小时`;
+    if (h) return `${h} 小时 ${m} 分`;
+    if (m) return `${m} 分 ${s} 秒`;
+    return `${s} 秒`;
   };
   const fmtBytes = (b) => {
     if (b == null) return '—';
@@ -206,14 +309,27 @@
   const fmtTime = (iso) => {
     if (!iso) return '—';
     const d = new Date(iso);
-    return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString();
+    return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString('zh-CN');
   };
   const setPill = (ok, text) => {
     const pill = $('pill');
-    pill.classList.toggle('ok', ok);
+    pill.classList.toggle('ok', ok === true);
     pill.classList.toggle('bad', ok === false);
     $('pill-text').textContent = text;
   };
+  const showLogin = () => {
+    $('login-view').hidden = false;
+    $('dashboard-view').hidden = true;
+    $('lock-btn').hidden = true;
+    setPill(null, '未解锁');
+  };
+  const showDashboard = () => {
+    $('login-view').hidden = true;
+    $('dashboard-view').hidden = false;
+    $('lock-btn').hidden = false;
+    setPill(true, '运行中');
+  };
+
   const lastResult = (u) => {
     if (u.lastError) return `<span class="bad">${esc(u.lastError)}</span>`;
     if (u.lastStatus == null) return '—';
@@ -221,23 +337,24 @@
     const cls = u.lastRcode === 0 || u.lastRcode === 3 ? 'good' : 'bad';
     return `<span class="${cls}">HTTP ${esc(u.lastStatus)}${rcode}</span>`;
   };
+
   const render = (data) => {
     $('version').textContent = data.version;
     $('node').textContent = `Node ${data.node}`;
     $('uptime').textContent = fmtUptime(data.uptime);
-    $('started').textContent = `since ${fmtTime(data.startedAt)}`;
+    $('started').textContent = `启动于 ${fmtTime(data.startedAt)}`;
     $('requests').textContent = data.stats.dohRequests;
-    $('last-request').textContent = data.stats.lastRequestAt ? `last ${fmtTime(data.stats.lastRequestAt)}` : 'no queries yet';
+    $('last-request').textContent = data.stats.lastRequestAt ? `最近 ${fmtTime(data.stats.lastRequestAt)}` : '暂无查询';
     const rate = data.stats.dohRequests ? Math.round((data.stats.dohOk / data.stats.dohRequests) * 100) : null;
     $('success').textContent = rate == null ? '—' : `${rate}%`;
-    $('errors').textContent = `${data.stats.dohErrors} upstream errors · ${data.stats.authFailures} auth failures`;
+    $('errors').textContent = `${data.stats.dohErrors} 上游错误 · ${data.stats.authFailures} 鉴权失败`;
     $('ecs').textContent = data.ecs;
     $('upstream-count').textContent = data.upstreams.length;
-    $('rate-limit').textContent = data.rateLimitPerMin ? `${data.rateLimitPerMin}/min` : 'off';
+    $('rate-limit').textContent = data.rateLimitPerMin ? `${data.rateLimitPerMin}/分钟` : '关闭';
     $('memory').textContent = `${fmtBytes(data.memory.rss)} RSS`;
-    $('platform').textContent = data.platform;
-    $('doh-path').textContent = data.dohPath;
-    $('updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
+    $('platform').textContent = `平台 ${data.platform}`;
+    $('masked-url').textContent = `${location.origin}/••••••••/${data.suffix}`;
+    $('updated').textContent = `更新于 ${new Date().toLocaleTimeString('zh-CN')}`;
     const rows = data.upstreams.map((u) => `
       <tr>
         <td><span class="host">${esc(u.host)}</span></td>
@@ -247,22 +364,173 @@
         <td>${esc(fmtRtt(u.lastRttMs))}</td>
         <td>${lastResult(u)}</td>
       </tr>`).join('');
-    $('upstreams').innerHTML = rows || '<tr><td colspan="6" class="empty">No upstreams configured.</td></tr>';
+    $('upstreams').innerHTML = rows || '<tr><td colspan="6" class="empty">没有配置上游。</td></tr>';
   };
+
   const load = async () => {
     try {
-      const res = await fetch('/api/status', { cache: 'no-store' });
+      const res = await fetch('/api/status', { cache: 'no-store', credentials: 'same-origin' });
+      if (res.status === 401) {
+        statusData = null;
+        showLogin();
+        return;
+      }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      render(data);
-      setPill(true, 'Running');
+      statusData = await res.json();
+      showDashboard();
+      render(statusData);
     } catch (err) {
-      setPill(false, `Status unavailable: ${err.message}`);
+      setPill(false, `无法连接：${err.message}`);
     }
   };
+
+  const unlock = async (event) => {
+    event.preventDefault();
+    $('login-error').hidden = true;
+    $('login-submit').disabled = true;
+    try {
+      const res = await fetch('/api/unlock', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ password: $('login-password').value }),
+      });
+      if (res.status === 401) {
+        $('login-error').textContent = '密码不正确，请重试。';
+        $('login-error').hidden = false;
+        return;
+      }
+      if (res.status === 429) {
+        $('login-error').textContent = '尝试过多，请稍后再试。';
+        $('login-error').hidden = false;
+        return;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      $('login-password').value = '';
+      await load();
+    } catch (err) {
+      $('login-error').textContent = `进入失败：${err.message}`;
+      $('login-error').hidden = false;
+    } finally {
+      $('login-submit').disabled = false;
+    }
+  };
+
+  const lock = async () => {
+    try {
+      await fetch('/api/lock', { method: 'POST', credentials: 'same-origin' });
+    } catch {}
+    statusData = null;
+    $('login-password').value = '';
+    showLogin();
+  };
+
+  const copyText = async (text) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok;
+    }
+  };
+
+  const closeCopyModal = () => {
+    $('copy-modal').hidden = true;
+    $('token-input').value = '';
+    $('copy-error').hidden = true;
+    $('copy-success').hidden = true;
+    $('copy-submit').disabled = false;
+  };
+
+  const openCopyModal = () => {
+    $('copy-modal').hidden = false;
+    $('copy-error').hidden = true;
+    $('copy-success').hidden = true;
+    $('token-input').value = '';
+    setTimeout(() => $('token-input').focus(), 50);
+  };
+
+  const reveal = async (event) => {
+    event.preventDefault();
+    $('copy-error').hidden = true;
+    $('copy-success').hidden = true;
+    $('copy-submit').disabled = true;
+    try {
+      const token = $('token-input').value;
+      const res = await fetch('/api/reveal', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token }),
+      });
+      if (res.status === 401) {
+        $('copy-error').textContent = 'Token 不正确，请重试。';
+        $('copy-error').hidden = false;
+        return;
+      }
+      if (res.status === 429) {
+        $('copy-error').textContent = '尝试过多，请稍后再试。';
+        $('copy-error').hidden = false;
+        return;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const suffix = (statusData && statusData.suffix) || 'weduolijia';
+      const url = `${location.origin}/${encodeURIComponent(token)}/${suffix}`;
+      const ok = await copyText(url);
+      if (!ok) throw new Error('剪贴板不可用');
+      $('copy-success').textContent = '已复制到剪贴板。';
+      $('copy-success').hidden = false;
+      $('token-input').value = '';
+      setTimeout(closeCopyModal, 1200);
+    } catch (err) {
+      $('copy-error').textContent = `复制失败：${err.message}`;
+      $('copy-error').hidden = false;
+    } finally {
+      $('copy-submit').disabled = false;
+    }
+  };
+
+  const currentTheme = () => {
+    const forced = document.documentElement.dataset.theme;
+    if (forced === 'light' || forced === 'dark') return forced;
+    return matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  };
+  const updateThemeButton = () => {
+    const dark = currentTheme() === 'dark';
+    $('theme-toggle').textContent = dark ? '☀ 亮色' : '☾ 暗色';
+    $('theme-toggle').title = dark ? '切换到亮色主题' : '切换到暗色主题';
+  };
+  $('theme-toggle').addEventListener('click', () => {
+    const next = currentTheme() === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem('idr-theme', next); } catch {}
+    updateThemeButton();
+  });
+
+  $('login-form').addEventListener('submit', unlock);
+  $('lock-btn').addEventListener('click', lock);
   $('refresh').addEventListener('click', load);
+  $('copy-open').addEventListener('click', openCopyModal);
+  $('copy-cancel').addEventListener('click', closeCopyModal);
+  $('copy-form').addEventListener('submit', reveal);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !$('copy-modal').hidden) closeCopyModal();
+  });
+
+  updateThemeButton();
   load();
-  setInterval(load, 5000);
+  setInterval(() => {
+    if (!$('dashboard-view').hidden) load();
+  }, 5000);
 })();
 </script>
 </body>

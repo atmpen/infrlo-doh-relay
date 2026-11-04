@@ -1,6 +1,6 @@
 'use strict';
 
-// Infrlo DoH relay — v1.5.0
+// Infrlo DoH relay — v1.6.0
 // RFC 8484 DNS-over-HTTPS relay. Infrlo expects the app on 0.0.0.0:5000.
 // Dependency-free on purpose: the platform only needs `node server.js`.
 
@@ -11,7 +11,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { buildEcsData, injectEcs } = require('./lib/ecs');
 
-const VERSION = '1.5.0';
+const VERSION = '1.6.0';
 const PORT = process.env.PORT === undefined || process.env.PORT === ''
   ? 5000
   : Number(process.env.PORT);
@@ -24,6 +24,9 @@ const UPSTREAMS = (process.env.DOH_UPSTREAMS ||
 const DOH_TOKEN = (process.env.DOH_TOKEN || '').trim();
 // The DoH URL is /<DOH_TOKEN>/<DOH_SUFFIX>; the suffix is one path segment.
 const DOH_SUFFIX = (process.env.DOH_SUFFIX || 'weduolijia').trim().replace(/^\/+|\/+$/g, '');
+// Homepage password; defaults to the DoH token when not set separately.
+const WEB_PASSWORD = (process.env.WEB_PASSWORD || DOH_TOKEN).trim();
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 if (!DOH_TOKEN) {
   console.error('DOH_TOKEN is required; refusing to start an unauthenticated relay.');
   process.exit(1);
@@ -111,6 +114,8 @@ function statusPayload() {
 
 const rateBuckets = new Map();
 const sessions = new Map();
+const webSessions = new Map();
+const webFailures = new Map();
 
 function isValidAnswer(data, queryId) {
   return (
@@ -375,10 +380,14 @@ function rateLimited(ip) {
   return bucket.count > RATE_LIMIT_PER_MIN;
 }
 
+function safeEqual(a, b) {
+  const left = Buffer.from(String(a || ''));
+  const right = Buffer.from(String(b || ''));
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
 function tokenMatches(candidate) {
-  const given = Buffer.from(String(candidate || ''));
-  const expected = Buffer.from(DOH_TOKEN);
-  return given.length === expected.length && crypto.timingSafeEqual(given, expected);
+  return safeEqual(candidate, DOH_TOKEN);
 }
 
 function readBody(req, cb) {
@@ -395,6 +404,119 @@ function readBody(req, cb) {
   });
   req.on('end', () => cb(tooLarge ? new Error('request body too large') : null, Buffer.concat(chunks)));
   req.on('error', (err) => cb(err));
+}
+
+function readCookie(req, name) {
+  const header = req.headers.cookie;
+  if (!header) return null;
+  for (const part of header.split(';')) {
+    const index = part.indexOf('=');
+    if (index < 0) continue;
+    if (part.slice(0, index).trim() === name) {
+      return decodeURIComponent(part.slice(index + 1).trim());
+    }
+  }
+  return null;
+}
+
+function sessionValid(req) {
+  const id = readCookie(req, 'idr_session');
+  if (!id) return false;
+  const expires = webSessions.get(id);
+  if (!expires || expires < Date.now()) {
+    if (expires) webSessions.delete(id);
+    return false;
+  }
+  return true;
+}
+
+function createSession() {
+  const id = crypto.randomBytes(32).toString('base64url');
+  webSessions.set(id, Date.now() + SESSION_TTL_MS);
+  return id;
+}
+
+function setSessionCookie(req, res, id, maxAgeSec = Math.floor(SESSION_TTL_MS / 1000)) {
+  const secure = req.headers['x-forwarded-proto'] === 'https' || Boolean(req.socket.encrypted);
+  const parts = [
+    `idr_session=${id}`,
+    'HttpOnly',
+    'SameSite=Strict',
+    'Path=/',
+    `Max-Age=${maxAgeSec}`,
+  ];
+  if (secure) parts.push('Secure');
+  res.setHeader('set-cookie', parts.join('; '));
+}
+
+function webFailureLimited(ip) {
+  const bucket = webFailures.get(ip);
+  return Boolean(bucket && Date.now() < bucket.reset && bucket.count >= 10);
+}
+
+function noteWebFailure(ip) {
+  const now = Date.now();
+  let bucket = webFailures.get(ip);
+  if (!bucket || now >= bucket.reset) {
+    bucket = { count: 0, reset: now + 60000 };
+    webFailures.set(ip, bucket);
+  }
+  bucket.count += 1;
+}
+
+function readJson(req, cb) {
+  readBody(req, (err, body) => {
+    if (err) return cb(err);
+    try {
+      cb(null, JSON.parse(body.toString('utf8')));
+    } catch {
+      cb(new Error('bad json'));
+    }
+  });
+}
+
+function sendJson(res, status, value) {
+  send(res, status, JSON.stringify(value), 'application/json; charset=utf-8');
+}
+
+function handleUnlock(req, res) {
+  const ip = clientIp(req);
+  if (webFailureLimited(ip)) return sendJson(res, 429, { error: 'too_many_attempts' });
+  readJson(req, (err, body) => {
+    if (err) return sendJson(res, 400, { error: 'bad_request' });
+    const password = String((body && body.password) || '');
+    if (!safeEqual(password, WEB_PASSWORD)) {
+      noteWebFailure(ip);
+      return sendJson(res, 401, { error: 'wrong_password' });
+    }
+    webFailures.delete(ip);
+    const id = createSession();
+    setSessionCookie(req, res, id);
+    sendJson(res, 200, { ok: true });
+  });
+}
+
+function handleReveal(req, res) {
+  if (!sessionValid(req)) return sendJson(res, 401, { error: 'locked' });
+  const ip = clientIp(req);
+  if (webFailureLimited(ip)) return sendJson(res, 429, { error: 'too_many_attempts' });
+  readJson(req, (err, body) => {
+    if (err) return sendJson(res, 400, { error: 'bad_request' });
+    const token = String((body && body.token) || '');
+    if (!safeEqual(token, DOH_TOKEN)) {
+      noteWebFailure(ip);
+      return sendJson(res, 401, { error: 'wrong_token' });
+    }
+    webFailures.delete(ip);
+    sendJson(res, 200, { ok: true });
+  });
+}
+
+function handleLock(req, res) {
+  const id = readCookie(req, 'idr_session');
+  if (id) webSessions.delete(id);
+  setSessionCookie(req, res, '', 0);
+  sendJson(res, 200, { ok: true });
 }
 
 function applyEcs(query) {
@@ -433,8 +555,18 @@ function handle(req, res) {
     );
   }
 
-  if (url.pathname === '/api/status') {
-    return send(res, 200, JSON.stringify(statusPayload()), 'application/json; charset=utf-8');
+  if (url.pathname === '/api/unlock' && req.method === 'POST') {
+    return handleUnlock(req, res);
+  }
+  if (url.pathname === '/api/status' && req.method === 'GET') {
+    if (!sessionValid(req)) return sendJson(res, 401, { error: 'locked' });
+    return sendJson(res, 200, statusPayload());
+  }
+  if (url.pathname === '/api/reveal' && req.method === 'POST') {
+    return handleReveal(req, res);
+  }
+  if (url.pathname === '/api/lock' && req.method === 'POST') {
+    return handleLock(req, res);
   }
 
   const segments = url.pathname.split('/').filter(Boolean);
@@ -536,6 +668,12 @@ setInterval(() => {
   const now = Date.now();
   for (const [ip, bucket] of rateBuckets) {
     if (now >= bucket.reset) rateBuckets.delete(ip);
+  }
+  for (const [id, expires] of webSessions) {
+    if (expires < now) webSessions.delete(id);
+  }
+  for (const [ip, bucket] of webFailures) {
+    if (now >= bucket.reset) webFailures.delete(ip);
   }
 }, 60000).unref();
 

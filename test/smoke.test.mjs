@@ -272,7 +272,7 @@ test('health endpoint reports the version', async () => {
     assert.equal(response.status, 200);
     const body = await response.json();
     assert.equal(body.status, 'ok');
-    assert.equal(body.version, '1.5.0');
+    assert.equal(body.version, '1.6.0');
     assert.equal(body.ecs, '111.8.1.0/24');
     assert.equal(body.auth, true);
     assert.equal(body.suffix, TEST_SUFFIX);
@@ -288,7 +288,8 @@ test('serves the status page at /', async () => {
     assert.equal(response.status, 200);
     assert.match(response.headers.get('content-type'), /text\/html/);
     const html = await response.text();
-    assert.match(html, /Infrlo DoH Relay/);
+    assert.match(html, /Infrlo DoH 中转/);
+    assert.match(html, /主页密码/);
     assert.match(html, /\/api\/status/);
     assert.equal(html.includes(TEST_TOKEN), false);
   } finally {
@@ -296,22 +297,78 @@ test('serves the status page at /', async () => {
   }
 });
 
-test('serves status JSON without the token', async () => {
-  const relay = await startRelay({ DOH_UPSTREAMS: mockUpstream });
+test('locks the status API and reveals the URL only after token check', async () => {
+  const relay = await startRelay({
+    DOH_UPSTREAMS: mockUpstream,
+    DOH_TOKEN: 'secret-token',
+    WEB_PASSWORD: 'ui-password',
+  });
   try {
+    assert.equal((await fetch(relay.base + '/api/status')).status, 401);
+
+    const badUnlock = await fetch(relay.base + '/api/unlock', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ password: 'nope' }),
+    });
+    assert.equal(badUnlock.status, 401);
+
+    const unlock = await fetch(relay.base + '/api/unlock', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ password: 'ui-password' }),
+    });
+    assert.equal(unlock.status, 200);
+    const setCookie = unlock.headers.get('set-cookie');
+    assert.ok(setCookie && setCookie.includes('idr_session='));
+    const cookie = setCookie.split(';')[0];
+
     const query = buildQuery('example.com');
-    assert.equal((await dohPost(relay.base, query)).status, 200);
-    const response = await fetch(relay.base + '/api/status');
-    assert.equal(response.status, 200);
-    const body = await response.json();
-    assert.equal(body.version, '1.5.0');
+    const doh = await fetch(`${relay.base}/secret-token/${TEST_SUFFIX}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/dns-message' },
+      body: query,
+    });
+    assert.equal(doh.status, 200);
+
+    const status = await fetch(relay.base + '/api/status', { headers: { cookie } });
+    assert.equal(status.status, 200);
+    const body = await status.json();
+    assert.equal(body.version, '1.6.0');
     assert.equal(body.auth, true);
     assert.equal(body.suffix, TEST_SUFFIX);
     assert.equal(body.stats.dohRequests, 1);
     assert.equal(body.stats.dohOk, 1);
     assert.equal(body.upstreams.length, 1);
     assert.ok(body.upstreams[0].wins >= 1);
-    assert.equal(JSON.stringify(body).includes(TEST_TOKEN), false);
+    assert.equal(JSON.stringify(body).includes('secret-token'), false);
+    assert.equal(JSON.stringify(body).includes('ui-password'), false);
+
+    const badReveal = await fetch(relay.base + '/api/reveal', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ token: 'nope' }),
+    });
+    assert.equal(badReveal.status, 401);
+
+    const goodReveal = await fetch(relay.base + '/api/reveal', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ token: 'secret-token' }),
+    });
+    assert.equal(goodReveal.status, 200);
+    assert.deepEqual(await goodReveal.json(), { ok: true });
+
+    const noSession = await fetch(relay.base + '/api/reveal', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: 'secret-token' }),
+    });
+    assert.equal(noSession.status, 401);
+
+    const lock = await fetch(relay.base + '/api/lock', { method: 'POST', headers: { cookie } });
+    assert.equal(lock.status, 200);
+    assert.equal((await fetch(relay.base + '/api/status', { headers: { cookie } })).status, 401);
   } finally {
     await stopRelay(relay.child);
   }
